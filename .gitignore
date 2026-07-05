@@ -1,0 +1,21 @@
+# Rust build output
+/target
+
+# Local, writable OVMF firmware variables (copied per-checkout from edk2 package)
+/OVMF_VARS.local.fd
+OVMF_VARS*.fd
+
+# QEMU ESP staging directory — build artifacts + locally-generated test configs.
+# Tracked test fixtures live under fixtures/ and are copied in by xtask.
+/esp/
+
+# Machine-local Claude Code settings + stray temp files
+.claude/settings.local.json
+.claude/*.tmp.*
+
+# Editor / OS cruft
+*.swp
+*~
+.DS_Store
+
+# NOTE: Cargo.lock is intentionally committed (GC-04) — do not ignore it.

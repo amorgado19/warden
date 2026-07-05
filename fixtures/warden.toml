@@ -1,0 +1,24 @@
+# Warden boot configuration (P1 test fixture).
+# Schema mirrors ADR-0001 IMP-005. Staged onto the ESP as \warden.toml by xtask.
+
+[global]
+timeout = 3            # seconds to auto-select `default`
+default = "demo"       # entry id selected on timeout
+console = "serial"     # serial | firmware | both
+
+[[entry]]
+id       = "demo"
+title    = "Demo Entry (Linux EFI)"
+protocol = "linux-efi"
+kernel   = "esp:/vmlinuz-demo"
+cmdline  = "console=ttyS0 ro quiet"
+
+[[entry]]
+id       = "rescue"
+title    = "Rescue Kernel (warden-rich)"
+protocol = "warden-rich"
+kernel   = "esp:/rescue.elf"
+
+[assess]
+enabled   = true
+max_tries = 3

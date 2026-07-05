@@ -1,0 +1,22 @@
+[package]
+name = "warden"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Warden — memory-safe UEFI boot manager."
+
+[[bin]]
+name = "warden"
+path = "src/main.rs"
+
+[dependencies]
+# `alloc` + `global_allocator`: boot-services-backed heap (needed for the owned
+# memory map and, from P1, config parsing). We deliberately do NOT enable the
+# crate's `logger`/`panic_handler` features — Warden supplies its own
+# serial-first logger (GC-02) and panic handler (GC-01).
+uefi = { version = "0.38.0", default-features = false, features = ["alloc", "global_allocator"] }
+log = { version = "0.4.33", default-features = false }
+warden-abi = { path = "../warden-abi" }

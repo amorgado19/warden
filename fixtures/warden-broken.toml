@@ -1,0 +1,12 @@
+# Deliberately malformed config for AC1.3 (broken TOML -> rescue prompt, no panic).
+# Faults: unterminated table header, unterminated string, missing value.
+
+[global]
+timeout = 3
+default = "demo"
+console = "serial"
+
+[[entry
+id       = "demo
+title    =
+protocol = "linux-efi"

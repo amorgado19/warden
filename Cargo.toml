@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["warden", "warden-abi", "xtask"]
+# `cargo build --target x86_64-unknown-uefi` at the root builds only these
+# no_std/UEFI members; xtask is a host tool and is built via `cargo xtask`.
+default-members = ["warden", "warden-abi"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Antonio (architect)"]
+repository = "https://example.invalid/warden"
+rust-version = "1.96"
+
+# Size-tuned, no-unwind release profile for the firmware binary (GC-04).
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = false
+
+[profile.dev]
+panic = "abort"
