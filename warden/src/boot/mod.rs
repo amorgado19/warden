@@ -1,0 +1,27 @@
+//! Kernel boot protocols.
+//!
+//! P2 implements the Linux path via the EFI stub ([`linux`]). The custom
+//! "warden-rich" handoff lands in P4.
+
+pub mod linux;
+
+use warden_config::{Config, Entry, Protocol};
+
+/// Boot the selected entry. Returns **only if the boot failed** (on success the
+/// kernel takes over the machine and never returns to us); the caller then drops
+/// to the rescue prompt.
+pub fn boot_entry(_config: &Config, entry: &Entry) {
+    match entry.protocol {
+        Protocol::LinuxEfi => {
+            if let Err(e) = linux::boot_linux(entry) {
+                log::error!("linux boot of '{}' failed: {e}", entry.id);
+            }
+        }
+        Protocol::WardenRich => {
+            log::warn!(
+                "entry '{}' uses protocol warden-rich, which is not implemented until P4",
+                entry.id
+            );
+        }
+    }
+}

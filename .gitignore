@@ -19,3 +19,6 @@ OVMF_VARS*.fd
 .DS_Store
 
 # NOTE: Cargo.lock is intentionally committed (GC-04) — do not ignore it.
+
+# P2 test assets (downloaded kernel, built initramfs) — do not commit
+/test-assets/

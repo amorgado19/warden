@@ -1,0 +1,17 @@
+# P2 Linux-boot fixture (AC2.1/AC2.2). Boots a stock vmlinuz via the EFI stub
+# with a minimal initramfs. The distinctive `warden_p2=cmdline_ok` token proves
+# the kernel received the configured command line (it appears in the kernel's
+# "Command line:" log — AC2.2).
+
+[global]
+timeout = 1
+default = "arch"
+console = "serial"
+
+[[entry]]
+id       = "arch"
+title    = "Arch Linux (stock vmlinuz + tiny initramfs)"
+protocol = "linux-efi"
+kernel   = "esp:/vmlinuz"
+initrd   = "esp:/initramfs.img"
+cmdline  = "console=ttyS0,115200 loglevel=7 warden_p2=cmdline_ok"

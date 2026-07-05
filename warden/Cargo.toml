@@ -18,6 +18,10 @@ path = "src/main.rs"
 # crate's `logger`/`panic_handler` features — Warden supplies its own
 # serial-first logger (GC-02) and panic handler (GC-01).
 uefi = { version = "0.38.0", default-features = false, features = ["alloc", "global_allocator"] }
+# Raw UEFI protocol structs — needed to set LoadedImage load options and to
+# implement the LOAD_FILE2 initrd protocol, which the high-level wrappers do not
+# expose. Pinned to the exact version the `uefi` crate resolves.
+uefi-raw = "=0.15.0"
 log = { version = "0.4.33", default-features = false }
 warden-abi = { path = "../warden-abi" }
 warden-config = { path = "../warden-config" }

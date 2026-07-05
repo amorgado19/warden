@@ -65,6 +65,11 @@ fn main() {
             stage();
             exit(if test_rescue() { 0 } else { 1 });
         }
+        Some("test-linux") => {
+            build();
+            stage();
+            exit(if test_linux() { 0 } else { 1 });
+        }
         Some("test-p1") => {
             build();
             stage();
@@ -76,7 +81,7 @@ fn main() {
             exit(if menu && input && rescue { 0 } else { 1 });
         }
         _ => {
-            eprintln!("usage: cargo xtask <build-x64 | run-x64 [config] | test-menu | test-input | test-rescue | test-p1>");
+            eprintln!("usage: cargo xtask <build-x64 | run-x64 [config] | test-menu | test-input | test-rescue | test-linux | test-p1>");
             exit(2);
         }
     }
@@ -87,53 +92,87 @@ fn main() {
 // ---------------------------------------------------------------------------
 
 /// AC1.1 — valid config renders entries and the timeout auto-selects `default`.
+/// In P2 a selection triggers a real boot; these fixtures name a kernel that is
+/// not staged, so the boot fails *gracefully* to the rescue prompt (no panic),
+/// which also exercises P2's boot-failure handling.
 fn test_menu() -> bool {
-    run_scenario(Scenario {
-        name: "menu (AC1.1)",
-        secs: 25,
-        config: "warden.toml", // timeout = 3, default = demo
-        input: None,
-        required: &[
+    run_scenario(warden_scenario(
+        "menu (AC1.1)",
+        25,
+        "warden.toml", // timeout = 3, default = demo (kernel not staged)
+        None,
+        &[
             "Warden v",
             "memory summary:",
             "Warden boot menu",
             "Demo Entry",
             "auto-selecting default",
             "selected entry: demo",
-            "reached final halt",
+            "linux boot of 'demo' failed", // boot attempted + failed gracefully
+            "WARDEN RESCUE",               // dropped to rescue, no panic
         ],
-        forbidden: FORBIDDEN,
-    })
+        FORBIDDEN,
+    ))
 }
 
 /// AC1.2 — a number key over serial changes the selection; the entry is booted.
+/// (The named kernel is not staged, so the boot then fails gracefully; AC1.2 is
+/// about the selection, proven by "selected entry: bravo".)
 fn test_input() -> bool {
-    run_scenario(Scenario {
-        name: "input (AC1.2)",
-        secs: 30,
-        config: "warden-wait.toml", // timeout = 0 -> waits for our keystroke
-        input: Some(b"2"),           // select the 2nd entry ("bravo")
-        required: &[
+    run_scenario(warden_scenario(
+        "input (AC1.2)",
+        30,
+        "warden-wait.toml", // timeout = 0 -> waits for our keystroke
+        Some(b"2"),          // select the 2nd entry ("bravo")
+        &[
             "Warden boot menu",
             "Bravo Entry",
             "number key selects",
             "selected entry: bravo",
-            "reached final halt",
+            "linux boot of 'bravo' failed",
         ],
-        forbidden: FORBIDDEN,
-    })
+        FORBIDDEN,
+    ))
 }
 
 /// AC1.3 — a malformed config yields a readable error + rescue prompt, no panic.
 fn test_rescue() -> bool {
+    run_scenario(warden_scenario(
+        "rescue (AC1.3)",
+        20,
+        "warden-broken.toml",
+        None,
+        // Rescue loops awaiting input, so "reached final halt" is intentionally
+        // NOT required; the clean-halt check (QEMU still running) proves no crash.
+        &["config error (line", "WARDEN RESCUE"],
+        &["WARDEN PANIC"],
+    ))
+}
+
+/// AC2.1/AC2.2 — boot a stock vmlinuz via the EFI stub with a minimal initramfs;
+/// the kernel logs its banner + our configured cmdline, reaches userspace, and
+/// powers off. Requires test-assets/{vmlinuz,initramfs.img} (see README/xtask).
+fn test_linux() -> bool {
     run_scenario(Scenario {
-        name: "rescue (AC1.3)",
-        secs: 20,
-        config: "warden-broken.toml",
+        name: "linux (AC2.1/AC2.2)",
+        secs: 90,
+        config: "warden-linux.toml",
+        mem: "512M",
+        accel: true,
+        stage: &[("vmlinuz", "vmlinuz"), ("initramfs.img", "initramfs.img")],
+        kernel_owns_exit: true,
         input: None,
-        // Rescue loops awaiting input, so "halting" is intentionally NOT required;
-        // the clean-halt check (QEMU still running at the deadline) proves no crash.
-        required: &["config error (line", "WARDEN RESCUE"],
+        required: &[
+            "selected entry: arch",    // Warden picked the linux entry
+            "starting Linux EFI stub", // Warden handed off
+            "Linux version 7.1.2",     // AC2.1: kernel booted to a serial log
+            // AC2.2: the KERNEL's own "Command line:" log carries our full
+            // configured cmdline. This is the kernel line (no quotes), NOT
+            // Warden's pre-handoff `cmdline: "..."` echo, so it only passes if
+            // the raw LoadOptions write actually delivered the cmdline.
+            "Command line: console=ttyS0,115200 loglevel=7 warden_p2=cmdline_ok",
+            "WARDEN-P2-USERSPACE-OK", // reached userspace (our init)
+        ],
         forbidden: &["WARDEN PANIC"],
     })
 }
@@ -142,21 +181,58 @@ struct Scenario {
     name: &'static str,
     secs: u64,
     config: &'static str,
-    /// Bytes to feed to the serial line ~10s after boot (once the menu is up).
+    /// QEMU RAM (a real kernel needs more than the Warden-only default).
+    mem: &'static str,
+    /// Use hardware acceleration (`kvm:tcg`) — needed for a real kernel boot.
+    accel: bool,
+    /// (test-assets basename, ESP basename) files to stage before boot.
+    stage: &'static [(&'static str, &'static str)],
+    /// If true, the guest (kernel) owns power: QEMU exiting is success, not a
+    /// Warden reboot loop.
+    kernel_owns_exit: bool,
+    /// Bytes to feed to the serial line once the menu is up (retried).
     input: Option<&'static [u8]>,
     required: &'static [&'static str],
     forbidden: &'static [&'static str],
 }
 
+/// Defaults for a Warden-only scenario (no kernel, small RAM, TCG).
+const fn warden_scenario(
+    name: &'static str,
+    secs: u64,
+    config: &'static str,
+    input: Option<&'static [u8]>,
+    required: &'static [&'static str],
+    forbidden: &'static [&'static str],
+) -> Scenario {
+    Scenario {
+        name,
+        secs,
+        config,
+        mem: "256M",
+        accel: false,
+        stage: &[],
+        kernel_owns_exit: false,
+        input,
+        required,
+        forbidden,
+    }
+}
+
 fn run_scenario(s: Scenario) -> bool {
     eprintln!("\n========== scenario: {} ==========", s.name);
     stage_config(s.config);
+    for (src, dst) in s.stage {
+        stage_asset(src, dst);
+    }
 
     let root = workspace_root();
     let mut cmd = Command::new("qemu-system-x86_64");
-    cmd.current_dir(&root)
-        .args(qemu_base_args(&root))
-        .args(["-display", "none", "-serial", "stdio"])
+    cmd.current_dir(&root).args(qemu_base_args(&root, s.mem));
+    if s.accel {
+        cmd.args(["-machine", "accel=kvm:tcg"]);
+    }
+    cmd.args(["-display", "none", "-serial", "stdio"])
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
     if s.input.is_some() {
@@ -165,7 +241,17 @@ fn run_scenario(s: Scenario) -> bool {
         cmd.stdin(Stdio::null());
     }
 
-    eprintln!("[xtask] booting QEMU headless (config={}, watchdog {}s)…", s.config, s.secs);
+    // On a host without KVM the accel scenarios fall back to slow TCG; scale the
+    // watchdog so a correct-but-slow boot doesn't false-fail.
+    let secs = if s.accel && !Path::new("/dev/kvm").exists() {
+        let bumped = s.secs * 4;
+        eprintln!("[xtask] /dev/kvm absent — QEMU falls back to slow TCG; watchdog {}s -> {bumped}s", s.secs);
+        bumped
+    } else {
+        s.secs
+    };
+
+    eprintln!("[xtask] booting QEMU headless (config={}, watchdog {secs}s)…", s.config);
     let mut child = cmd.spawn().expect("failed to spawn qemu-system-x86_64");
     let mut stdout = child.stdout.take().expect("piped stdout");
 
@@ -197,7 +283,7 @@ fn run_scenario(s: Scenario) -> bool {
         }
     }
 
-    let outcome = watch(&mut child, s.secs);
+    let outcome = watch(&mut child, secs);
 
     let buf = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
     let _ = reader.join();
@@ -217,7 +303,15 @@ fn run_scenario(s: Scenario) -> bool {
         }
     }
     match outcome {
+        Outcome::CleanHalt if s.kernel_owns_exit => {
+            // The kernel should have powered off; still running is suspicious but
+            // the markers are the source of truth, so don't fail solely on this.
+            eprintln!("[xtask] exit   WARN: guest still running at deadline (expected power-off)");
+        }
         Outcome::CleanHalt => eprintln!("[xtask] halt     OK: QEMU still running at deadline (clean halt)"),
+        Outcome::ExitedEarly(status) if s.kernel_owns_exit => {
+            eprintln!("[xtask] exit     OK: guest powered off ({status}) — kernel owns exit")
+        }
         Outcome::ExitedEarly(status) => {
             eprintln!("[xtask] halt   FAIL: QEMU exited early ({status}) — reset/triple-fault or launch error");
             ok = false;
@@ -344,7 +438,7 @@ fn resolve_ovmf(root: &Path) -> (String, String) {
     (code, vars)
 }
 
-fn qemu_base_args(root: &Path) -> Vec<String> {
+fn qemu_base_args(root: &Path, mem: &str) -> Vec<String> {
     let (ovmf_code, ovmf_vars) = resolve_ovmf(root);
     let esp = root.join("esp");
     vec![
@@ -355,17 +449,34 @@ fn qemu_base_args(root: &Path) -> Vec<String> {
         "-drive".into(),
         format!("format=raw,file=fat:rw:{}", esp.display()),
         "-m".into(),
-        "256M".into(),
+        mem.into(),
         "-no-reboot".into(),
     ]
+}
+
+/// Copy a built test asset (`test-assets/<src>`) onto the ESP as `<dst>`.
+fn stage_asset(src: &str, dst: &str) {
+    let root = workspace_root();
+    let from = root.join("test-assets").join(src);
+    let to = root.join("esp").join(dst);
+    std::fs::copy(&from, &to).unwrap_or_else(|e| {
+        eprintln!(
+            "[xtask] staging asset {} -> {} failed: {e}\n\
+             [xtask] build it first: `bash test/build-initramfs.sh` and place a kernel at test-assets/vmlinuz",
+            from.display(),
+            to.display()
+        );
+        exit(1);
+    });
+    eprintln!("[xtask] staged asset {} -> {}", from.display(), to.display());
 }
 
 fn run_interactive() {
     let root = workspace_root();
     let mut cmd = Command::new("qemu-system-x86_64");
     cmd.current_dir(&root)
-        .args(qemu_base_args(&root))
-        .args(["-serial", "stdio", "-nographic"]);
+        .args(qemu_base_args(&root, "512M"))
+        .args(["-machine", "accel=kvm:tcg", "-serial", "stdio", "-nographic"]);
     eprintln!("[xtask] launching QEMU (interactive). Ctrl-A X to quit.");
     let status = cmd.status().expect("failed to spawn qemu-system-x86_64");
     if !status.success() {

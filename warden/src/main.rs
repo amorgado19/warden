@@ -11,6 +11,7 @@
 extern crate alloc;
 
 mod arch;
+mod boot;
 mod console;
 mod firmware;
 mod fs;
@@ -27,9 +28,6 @@ const TARGET_ARCH: &str = if cfg!(target_arch = "x86_64") {
 } else {
     "unknown"
 };
-
-/// Config file, at the root of the ESP Warden was loaded from.
-const CONFIG_PATH: &uefi::CStr16 = uefi::cstr16!("warden.toml");
 
 /// Firmware entry point. The `#[entry]` macro records the image handle and
 /// system table (used by `uefi::boot`/`uefi::system`) and exports this as
@@ -79,7 +77,7 @@ fn efi_main() -> Status {
 fn boot_menu_phase() {
     use alloc::format;
 
-    let bytes = match fs::read_esp_file(CONFIG_PATH) {
+    let bytes = match fs::read_config() {
         Ok(b) => b,
         Err(e) => {
             log::error!("config load failed: {e}");
@@ -125,7 +123,9 @@ fn boot_menu_phase() {
                 e.protocol.as_str(),
                 e.kernel
             );
-            log::info!("kernel handoff is implemented in P2 — halting after selection");
+            // Hands control to the kernel; only returns if the boot failed.
+            boot::boot_entry(&config, e);
+            console::rescue::run(Some(&config), "the selected entry failed to boot");
         }
         console::menu::Choice::Rescue => {
             console::rescue::run(Some(&config), "rescue requested from the menu");
