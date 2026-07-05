@@ -14,8 +14,13 @@
 use core::fmt::{self, Write};
 
 use log::{LevelFilter, Metadata, Record};
+use warden_config::ConsoleMode;
 
 use crate::arch;
+
+pub mod input;
+pub mod menu;
+pub mod rescue;
 
 /// A zero-sized writer over the primary serial line (COM1).
 ///
@@ -77,4 +82,36 @@ pub fn init() {
     arch::serial_init();
     let _ = log::set_logger(&LOGGER);
     log::set_max_level(LevelFilter::Trace);
+}
+
+/// Emit UI text (the menu, the rescue prompt) to the console(s) selected by the
+/// `console = …` config (DEC-008). Diagnostic *logging* always goes to serial
+/// via the `log` backend above; this routing is only for interactive UI so that
+/// e.g. `console = "firmware"` can drive a screen without doubling on serial.
+///
+/// The firmware console is written only when actually present, so this never
+/// triggers `with_stdout`'s null-pointer assertions.
+pub fn emit(mode: ConsoleMode, s: &str) {
+    if matches!(mode, ConsoleMode::Serial | ConsoleMode::Both) {
+        let mut serial = Serial::new();
+        let _ = serial.write_str(s);
+    }
+    if matches!(mode, ConsoleMode::Firmware | ConsoleMode::Both) && stdout_present() {
+        uefi::system::with_stdout(|out| {
+            let _ = out.write_str(s);
+        });
+    }
+}
+
+/// Returns `true` iff boot services are live and a stdout console exists.
+fn stdout_present() -> bool {
+    match uefi::table::system_table_raw() {
+        // SAFETY: pointer installed by `#[entry]`; valid while boot services are
+        // alive. We only read two pointer fields and never retain the reference.
+        Some(st) => unsafe {
+            let st = st.as_ref();
+            !st.boot_services.is_null() && !st.stdout.is_null()
+        },
+        None => false,
+    }
 }

@@ -1,0 +1,19 @@
+# Input-test fixture (AC1.2): timeout = 0 means the menu waits forever, so the
+# harness can inject a keystroke and observe the selection change deterministically.
+
+[global]
+timeout = 0
+default = "alpha"
+console = "serial"
+
+[[entry]]
+id       = "alpha"
+title    = "Alpha Entry"
+protocol = "linux-efi"
+kernel   = "esp:/alpha"
+
+[[entry]]
+id       = "bravo"
+title    = "Bravo Entry"
+protocol = "linux-efi"
+kernel   = "esp:/bravo"

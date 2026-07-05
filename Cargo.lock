@@ -140,10 +140,15 @@ dependencies = [
  "log",
  "uefi",
  "warden-abi",
+ "warden-config",
 ]
 
 [[package]]
 name = "warden-abi"
+version = "0.1.0"
+
+[[package]]
+name = "warden-config"
 version = "0.1.0"
 
 [[package]]

@@ -1,0 +1,138 @@
+//! The numbered text boot menu (T1.3): renders entries, runs a countdown that
+//! auto-selects the default, and accepts serial/console input to move the
+//! highlight or pick an entry.
+
+use alloc::string::String;
+use core::fmt::Write;
+use core::time::Duration;
+
+use uefi::boot::stall;
+use warden_config::Config;
+
+use crate::console::{self, input::InputReader, input::Key};
+
+/// The operator's decision from the menu.
+pub enum Choice {
+    /// Boot the entry at this index.
+    Boot(usize),
+    /// Drop to the rescue prompt.
+    Rescue,
+}
+
+/// Poll cadence. Small enough to feel responsive, large enough not to busy-spin.
+const TICK_MS: u64 = 50;
+
+/// Render the menu and run the selection loop until the operator chooses or the
+/// countdown elapses. Never returns until a choice is made.
+pub fn run(config: &Config) -> Choice {
+    let mode = config.global.console;
+    let n = config.entries.len();
+    let mut sel = config.default_index();
+    render(config, sel);
+
+    // Countdown in ms; `None` == wait forever (timeout == 0).
+    let mut remaining: Option<i64> = match config.global.timeout {
+        0 => None,
+        secs => Some(i64::from(secs) * 1000),
+    };
+    status(config, remaining);
+    // Track the *displayed* (ceil) second so the re-render trigger and the shown
+    // value stay in lockstep (otherwise the top second prints twice).
+    let mut last_secs_shown = remaining.map(|ms| (ms + 999) / 1000);
+
+    let mut reader = InputReader::new();
+    loop {
+        if let Some(key) = reader.poll() {
+            // Any key cancels the countdown and enters interactive mode.
+            if remaining.is_some() {
+                remaining = None;
+                console::emit(mode, "\n[input received — countdown cancelled]\n");
+            }
+            match key {
+                Key::Up => {
+                    sel = (sel + n - 1) % n;
+                    render(config, sel);
+                    status(config, None);
+                }
+                Key::Down => {
+                    sel = (sel + 1) % n;
+                    render(config, sel);
+                    status(config, None);
+                }
+                Key::Digit(d) => {
+                    let d = d as usize;
+                    if (1..=n).contains(&d) {
+                        console::emit(mode, "\n[number key selects]\n");
+                        return Choice::Boot(d - 1);
+                    }
+                    // out-of-range digit: ignore
+                }
+                Key::Enter => return Choice::Boot(sel),
+                Key::Rescue => return Choice::Rescue,
+            }
+            continue;
+        }
+
+        stall(Duration::from_millis(TICK_MS));
+
+        if let Some(ms) = remaining {
+            let ms = ms - TICK_MS as i64;
+            if ms <= 0 {
+                console::emit(mode, "\n[timeout — auto-selecting default]\n");
+                return Choice::Boot(config.default_index());
+            }
+            remaining = Some(ms);
+            let secs = (ms + 999) / 1000; // ceil — matches what status() prints
+            if Some(secs) != last_secs_shown {
+                last_secs_shown = Some(secs);
+                status(config, remaining);
+            }
+        }
+    }
+}
+
+fn render(config: &Config, sel: usize) {
+    let mut s = String::new();
+    s.push_str("\n=== Warden boot menu ===\n");
+    for (i, e) in config.entries.iter().enumerate() {
+        let marker = if i == sel { '>' } else { ' ' };
+        let default_tag = if e.id == config.global.default { "  (default)" } else { "" };
+        // Ignore fmt errors: writing into a String is infallible.
+        let _ = write!(
+            s,
+            "  {} {}) {:<30} [{}]{}\n",
+            marker,
+            i + 1,
+            e.title,
+            e.protocol.as_str(),
+            default_tag
+        );
+    }
+    console::emit(config.global.console, &s);
+}
+
+fn status(config: &Config, remaining: Option<i64>) {
+    // Number-key selection only reaches 1..=9 (single digit). Entries beyond
+    // that are still reachable with up/down, but don't advertise a number that
+    // would be ignored.
+    let sel_max = config.entries.len().min(9);
+    let mut s = String::new();
+    match remaining {
+        Some(ms) => {
+            let secs = (ms + 999) / 1000; // ceil to whole seconds
+            let _ = write!(
+                s,
+                "auto-boot '{}' in {}s  (up/down or j/k move, 1-{} select, Enter boot, r rescue)\n",
+                config.global.default, secs, sel_max
+            );
+        }
+        None => {
+            let _ = write!(
+                s,
+                "select: up/down or j/k move, 1-{} number, Enter boot, r rescue\n",
+                sel_max
+            );
+        }
+    }
+    console::emit(config.global.console, &s);
+}
