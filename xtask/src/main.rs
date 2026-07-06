@@ -180,6 +180,9 @@ fn main() {
             sign_kernel();
             exit(if test_secure_bad() { 0 } else { 1 });
         }
+        Some("test-secure-enrolled") => {
+            exit(if test_secure_enrolled() { 0 } else { 1 });
+        }
         Some("test-p3") => {
             build();
             stage();
@@ -1288,6 +1291,147 @@ fn sign_efi() {
         eprintln!("[xtask] sbverify FAILED");
         exit(1);
     }
+}
+
+/// Secure-Boot OVMF `CODE` images (SMM build) across Arch + Debian/Ubuntu.
+const OVMF_SECBOOT_CODES: &[&str] = &[
+    "/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd",
+    "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd",
+    "/usr/share/OVMF/OVMF_CODE.secboot.fd",
+];
+
+/// Run a host tool, exiting with a message on failure.
+fn run_or_die(cmd: &str, args: &[&str], desc: &str) {
+    let status = Command::new(cmd).args(args).status().unwrap_or_else(|e| {
+        eprintln!("[xtask] cannot run `{cmd}` ({e}) — is it installed and on PATH?");
+        exit(1);
+    });
+    if !status.success() {
+        eprintln!("[xtask] {desc} failed");
+        exit(1);
+    }
+}
+
+/// AC3.3 — the full Secure Boot round-trip. Sign warden.efi with a test db key,
+/// enroll PK/KEK/db into an OVMF variable store (setup mode → user mode, Secure
+/// Boot on), boot the signed Warden under the Secure-Boot firmware with an
+/// UNSIGNED kernel entry, and confirm Warden reads `SecureBoot=1` and REFUSES the
+/// entry. Requires `virt-fw-vars` (virt-firmware), `sbsign`, `openssl`, and an
+/// `OVMF_CODE.secboot*` image on the host.
+fn test_secure_enrolled() -> bool {
+    let root = workspace_root();
+    let ta = root.join("test-assets");
+    std::fs::create_dir_all(&ta).ok();
+
+    build();
+    stage_config("warden-unsigned.toml");
+    stage_asset("vmlinuz", "vmlinuz");
+    stage_asset("initramfs.img", "initramfs.img");
+
+    // 1. A test db keypair (RSA-2048 self-signed).
+    let key = ta.join("db.key");
+    let crt = ta.join("db.crt");
+    if !key.exists() || !crt.exists() {
+        run_or_die(
+            "openssl",
+            &[
+                "req", "-new", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650",
+                "-subj", "/CN=Warden Test db/",
+                "-keyout", &key.to_string_lossy(),
+                "-out", &crt.to_string_lossy(),
+            ],
+            "openssl cert generation",
+        );
+    }
+
+    // 2. Sign the staged BOOTX64.EFI so the Secure-Boot firmware will load it.
+    let signed = ta.join("BOOTX64.signed.efi");
+    let esp_efi = root.join(ESP_TARGET);
+    run_or_die(
+        "sbsign",
+        &[
+            "--key", &key.to_string_lossy(),
+            "--cert", &crt.to_string_lossy(),
+            "--output", &signed.to_string_lossy(),
+            &esp_efi.to_string_lossy(),
+        ],
+        "sbsign warden.efi",
+    );
+    std::fs::copy(&signed, &esp_efi).expect("stage signed BOOTX64.EFI");
+
+    // 3. Enroll PK/KEK/db into a fresh vars store (setup → user mode).
+    let (_, vars_tpl) = find_firmware("OVMF_CODE", OVMF_PAIRS);
+    let enrolled = ta.join("OVMF_VARS.secboot.fd");
+    let cs = crt.to_string_lossy();
+    const OWNER_GUID: &str = "605dab50-e046-4300-abb6-3dd810dd8b23";
+    run_or_die(
+        "virt-fw-vars",
+        &[
+            "-i", &vars_tpl,
+            "-o", &enrolled.to_string_lossy(),
+            "--set-pk", OWNER_GUID, &cs,
+            "--add-kek", OWNER_GUID, &cs,
+            "--add-db", OWNER_GUID, &cs,
+        ],
+        "virt-fw-vars enrollment (install virt-firmware; ensure ~/.local/bin is on PATH)",
+    );
+
+    let secboot_code = match OVMF_SECBOOT_CODES.iter().find(|p| Path::new(p).exists()) {
+        Some(p) => *p,
+        None => {
+            eprintln!("[xtask] no Secure-Boot OVMF code found (looked for OVMF_CODE.secboot*)");
+            return false;
+        }
+    };
+    let vars_local = root.join("OVMF_VARS.secboot.local.fd");
+    std::fs::copy(&enrolled, &vars_local).expect("copy enrolled vars");
+
+    // 4. Boot under Secure Boot. The secure variable store needs q35 + SMM.
+    let mut cmd = Command::new("qemu-system-x86_64");
+    cmd.current_dir(&root)
+        .args(["-machine", "q35,smm=on,accel=kvm:tcg"])
+        .args(["-global", "driver=cfi.pflash01,property=secure,value=on"])
+        .args(["-global", "ICH9-LPC.disable_s3=1"])
+        .args(["-drive", &format!("if=pflash,format=raw,unit=0,readonly=on,file={secboot_code}")])
+        .args(["-drive", &format!("if=pflash,format=raw,unit=1,file={}", vars_local.display())])
+        .args(["-drive", &format!("format=raw,file=fat:rw:{}", root.join("esp").display())])
+        .args(["-m", "512M", "-display", "none", "-serial", "stdio"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .stdin(Stdio::null());
+
+    let secs = if Path::new("/dev/kvm").exists() { 40 } else { 120 };
+    eprintln!("[xtask] booting Secure-Boot QEMU (enrolled PK/KEK/db + signed warden.efi, watchdog {secs}s)…");
+    let mut child = cmd.spawn().expect("failed to spawn qemu-system-x86_64");
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let (tx, rx) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = stdout.read_to_end(&mut b);
+        let _ = tx.send(b);
+    });
+    let _ = watch(&mut child, secs);
+    let buf = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+    let _ = reader.join();
+    let log = String::from_utf8_lossy(&buf);
+    println!("----- captured serial (secure-enrolled) -----\n{log}\n----- end serial -----");
+
+    let required = ["Secure Boot: ENABLED", "REFUSING to boot unsigned entry", "WARDEN RESCUE"];
+    let forbidden = ["WARDEN PANIC", "Linux version"];
+    let mut ok = true;
+    for m in required {
+        let p = log.contains(m);
+        eprintln!("[xtask] require {:>4}: {m:?}", if p { "OK" } else { "MISS" });
+        ok &= p;
+    }
+    for f in forbidden {
+        if log.contains(f) {
+            eprintln!("[xtask] forbid  HIT: {f:?}");
+            ok = false;
+        }
+    }
+    eprintln!("[xtask] scenario secure-enrolled (AC3.3): {}", if ok { "PASS" } else { "FAIL" });
+    ok
 }
 
 /// Start an emulated TPM 2.0 (swtpm) on a fresh state dir, returning the process

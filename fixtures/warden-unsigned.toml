@@ -1,0 +1,16 @@
+# P3 AC3.3 fixture: an UNSIGNED kernel entry. Booted under a Secure-Boot-enrolled
+# firmware (SecureBoot=1), Warden must REFUSE it and drop to rescue — proving the
+# enrolled-keys → SecureBoot=1 → unsigned-refused round-trip.
+
+[global]
+timeout = 1
+default = "arch"
+console = "serial"
+
+[[entry]]
+id       = "arch"
+title    = "Arch Linux (UNSIGNED — must be refused under Secure Boot)"
+protocol = "linux-efi"
+kernel   = "esp:/vmlinuz"
+initrd   = "esp:/initramfs.img"
+cmdline  = "console=ttyS0,115200 warden_p3=should_not_boot"
