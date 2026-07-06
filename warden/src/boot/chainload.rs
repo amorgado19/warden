@@ -13,7 +13,7 @@
 use alloc::format;
 use alloc::string::String;
 
-use uefi::boot::{self, LoadImageSource};
+use uefi::boot;
 use warden_config::Entry;
 
 use crate::{fs, measure, trust};
@@ -54,11 +54,7 @@ pub fn boot_chainload(entry: &Entry, config_bytes: &[u8]) -> Result<(), String> 
     });
     log::info!("measured boot: {outcome:?}");
 
-    let image = boot::load_image(
-        boot::image_handle(),
-        LoadImageSource::FromBuffer { buffer: &image_bytes, file_path: None },
-    )
-    .map_err(|e| format!("LoadImage failed: {e:?}"))?;
+    let image = super::load_image_from_buffer(&image_bytes)?;
 
     log::info!("chainloading '{}' via StartImage…", entry.id);
     let result = boot::start_image(image).map_err(|e| format!("StartImage failed: {e:?}"));

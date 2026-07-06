@@ -17,7 +17,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::ffi::c_void;
 
-use uefi::boot::{self, LoadImageSource};
+use uefi::boot;
 use uefi::proto::loaded_image::LoadedImage;
 use uefi::Handle;
 use uefi_raw::protocol::loaded_image::LoadedImageProtocol;
@@ -87,11 +87,7 @@ pub fn boot_linux(entry: &Entry, config_bytes: &[u8]) -> Result<(), String> {
     });
     log::info!("measured boot: {outcome:?}");
 
-    let image = boot::load_image(
-        boot::image_handle(),
-        LoadImageSource::FromBuffer { buffer: &kernel, file_path: None },
-    )
-    .map_err(|e| format!("LoadImage failed: {e:?}"))?;
+    let image = super::load_image_from_buffer(&kernel)?;
 
     // `run_loaded` only returns on failure; unload the image on the way out so a
     // failed boot doesn't orphan it in firmware memory.

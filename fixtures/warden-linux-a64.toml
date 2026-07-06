@@ -1,0 +1,18 @@
+# P2-on-aarch64 fixture (AC2.1/AC2.2). Boots a real Arch Linux ARM aarch64
+# kernel (EFI-stub Image) via Warden's linux-efi path. `console=ttyAMA0` is the
+# QEMU virt PL011 UART. The distinctive `warden_p2_a64=cmdline_ok` token proves
+# the kernel received the configured command line (AC2.2). No initramfs is
+# staged, so the kernel logs its full boot then panics on "no root" — which is
+# after the AC2.1/AC2.2 markers (a Linux panic, not a Warden one).
+
+[global]
+timeout = 1
+default = "arch"
+console = "serial"
+
+[[entry]]
+id       = "arch"
+title    = "Arch Linux ARM (aarch64, EFI stub)"
+protocol = "linux-efi"
+kernel   = "esp:/Image"
+cmdline  = "console=ttyAMA0 earlycon loglevel=7 warden_p2_a64=cmdline_ok"

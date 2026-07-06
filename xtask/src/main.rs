@@ -129,6 +129,9 @@ fn main() {
         Some("test-a64-rich") => {
             exit(if test_a64_rich() { 0 } else { 1 });
         }
+        Some("test-a64-linux") => {
+            exit(if test_a64_linux() { 0 } else { 1 });
+        }
         Some("test-a64-measured") => {
             exit(if test_a64_measured() { 0 } else { 1 });
         }
@@ -702,6 +705,27 @@ fn test_a64_smoke() -> bool {
         150,
         false,
         &["[aarch64]", "UEFI memory map:", "memory summary:", "=== Warden boot menu ===", "auto-boot 'demo'"],
+        &["WARDEN PANIC"],
+    )
+}
+
+/// P2 on aarch64 (AC2.1/AC2.2) — boot a real Arch Linux ARM aarch64 kernel via
+/// the EFI-stub `linux-efi` path and confirm the kernel logs + receives the
+/// configured cmdline. Requires test-assets/Image (an arm64 EFI-stub kernel).
+fn test_a64_linux() -> bool {
+    let root = workspace_root();
+    if !root.join("test-assets/Image").exists() {
+        eprintln!("[xtask] test-assets/Image (arm64 kernel) missing — extract it from an Arch Linux ARM tarball");
+        return false;
+    }
+    build_a64();
+    stage_a64_config("warden-linux-a64.toml");
+    std::fs::copy(root.join("test-assets/Image"), root.join(ESP_A64).join("Image")).expect("stage arm64 Image");
+    run_a64(
+        "aarch64 linux (AC2.1/AC2.2)",
+        220, // a full arm64 kernel boot under TCG is slow
+        false,
+        &["Linux version 7.", "Kernel command line: console=ttyAMA0", "warden_p2_a64=cmdline_ok"],
         &["WARDEN PANIC"],
     )
 }

@@ -8,7 +8,29 @@ mod elf;
 pub mod linux;
 pub mod warden_rich;
 
+use alloc::format;
+use alloc::string::String;
+
+use uefi::boot::{self, LoadImageSource};
+use uefi::proto::loaded_image::LoadedImage;
+use uefi::Handle;
 use warden_config::{Config, Entry, Protocol};
+
+/// `LoadImage` an EFI image from an in-memory buffer (the exact verified bytes).
+///
+/// We pass Warden's own image device path (from our `LoadedImage`) as the
+/// `file_path`: AAVMF (ArmVirtQemu) returns `INVALID_PARAMETER` for a `FromBuffer`
+/// load with a NULL device path (it needs one to set the loaded image's
+/// `FilePath`), whereas OVMF tolerates NULL. Reusing our own path is a valid
+/// device path on both arches; the `SourceBuffer` still determines the actual
+/// bytes loaded, so this does not weaken the verify-then-execute guarantee.
+pub fn load_image_from_buffer(buffer: &[u8]) -> Result<Handle, String> {
+    // Keep the protocol wrapper alive across `load_image` (it borrows the path).
+    let self_li = boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle()).ok();
+    let file_path = self_li.as_ref().and_then(|li| li.file_path());
+    boot::load_image(boot::image_handle(), LoadImageSource::FromBuffer { buffer, file_path })
+        .map_err(|e| format!("LoadImage failed: {e:?}"))
+}
 
 /// Boot the selected entry. Returns **only if the boot failed** (on success the
 /// kernel takes over the machine and never returns to us); the caller then drops
