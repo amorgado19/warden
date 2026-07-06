@@ -11,7 +11,11 @@ use alloc::vec::Vec;
 
 const PT_LOAD: u32 = 1;
 const ET_EXEC: u16 = 2;
-const EM_X86_64: u16 = 0x3E;
+/// Expected `e_machine`: the kernel must be built for the arch Warden runs on.
+#[cfg(target_arch = "x86_64")]
+const EXPECTED_MACHINE: u16 = 0x3E; // EM_X86_64
+#[cfg(target_arch = "aarch64")]
+const EXPECTED_MACHINE: u16 = 0xB7; // EM_AARCH64
 
 /// One loadable segment. The BSS tail (`mem_size > file_size`) needs no field:
 /// the loader zeroes the whole kernel region before copying `file_size` bytes.
@@ -49,8 +53,8 @@ pub fn parse(elf: &[u8]) -> Result<Image, String> {
         return Err(format!("unsupported ELF type {e_type} (want EXEC)"));
     }
     let e_machine = u16(hdr, 18);
-    if e_machine != EM_X86_64 {
-        return Err(format!("ELF machine {e_machine:#x} is not x86-64"));
+    if e_machine != EXPECTED_MACHINE {
+        return Err(format!("ELF machine {e_machine:#x} does not match this build ({EXPECTED_MACHINE:#x})"));
     }
 
     let entry = u64f(hdr, 24);

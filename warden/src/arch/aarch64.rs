@@ -55,31 +55,75 @@ pub fn serial_read_byte() -> Option<u8> {
     }
 }
 
-/// Install the kernel translation tables and jump to `entry`, passing `arg` in
-/// `x0` (AAPCS64 first argument). `ttbr_phys` is loaded into `TTBR0_EL1` (the
-/// low-half table that must map both the current instruction stream and the
-/// trampoline); the higher-half kernel/HHDM mapping is installed via `TTBR1_EL1`
-/// by the rich-handoff builder before this is called. Never returns.
+/// `MAIR_EL1`: attr0 = Normal, Inner+Outer Write-Back non-transient (`0xFF`);
+/// attr1 = Device-nGnRnE (`0x00`). The page-table builder tags RAM with AttrIndx
+/// 0 and device MMIO with AttrIndx 1.
+pub const MAIR_VALUE: u64 = 0x0000_0000_0000_00FF;
+
+/// `TCR_EL1`: 48-bit VA for both halves (T0SZ=T1SZ=16), 4 KiB granule (TG0=00,
+/// TG1=10), inner-shareable Write-Back-WA table walks, IPS = 40-bit PA (covers
+/// the QEMU `virt` map, ≤ the Cortex-A72 44-bit PARange).
+pub const TCR_VALUE: u64 = 0x0000_0002_B510_3510;
+
+/// Install the rich-handoff translation tables and jump to `entry`, passing `arg`
+/// in `x0` (AAPCS64 first argument). `ttbr0` maps the low half (identity — the
+/// current instruction stream, the page tables, and device MMIO); `ttbr1` maps
+/// the high half (the HHDM and the higher-half kernel). Never returns.
 ///
 /// # Safety
-/// Boot services must be exited. The translation tables must map the current PC
-/// (so the post-`msr` fetch doesn't fault) and `entry`; `entry` must be
+/// Boot services must be exited. The tables must map the current PC (identity, so
+/// the fetch after the register writes doesn't fault) and `entry`; `entry` must be
 /// executable code expecting a `WardenBootInfo*` in `x0`. Interrupts are masked.
-pub unsafe fn enter_kernel(ttbr_phys: u64, entry: u64, arg: u64) -> ! {
+/// The firmware MMU is left enabled (`SCTLR_EL1.M=1`); we only swap the tables and
+/// the matching `TCR`/`MAIR`, with the trampoline running identity-mapped across
+/// the switch.
+pub unsafe fn enter_kernel(ttbr0: u64, ttbr1: u64, entry: u64, arg: u64) -> ! {
     asm!(
-        "msr daifset, #0xf",     // mask D/A/I/F interrupts
-        "msr ttbr0_el1, {ttbr}", // install the low-half translation table
+        "msr daifset, #0xf",       // mask D/A/I/F interrupts
+        "dsb ish",                 // page-table descriptor stores visible to the walker
+        "msr mair_el1, {mair}",    // memory attribute indirection
+        "msr ttbr0_el1, {ttbr0}",  // low-half (identity) table
+        "msr ttbr1_el1, {ttbr1}",  // high-half (HHDM + kernel) table
+        "msr tcr_el1, {tcr}",      // 48-bit / 4 KiB regime matching the tables
+        "isb",
+        "tlbi vmalle1",            // drop stale stage-1 EL1 translations
         "dsb ish",
         "isb",
-        "tlbi vmalle1",          // invalidate stage-1 TLB for EL1
-        "dsb ish",
-        "isb",
-        "br {entry}",            // jump; x0 already holds arg
-        ttbr = in(reg) ttbr_phys,
+        "br {entry}",              // jump; x0 already holds arg
+        mair = in(reg) MAIR_VALUE,
+        tcr = in(reg) TCR_VALUE,
+        ttbr0 = in(reg) ttbr0,
+        ttbr1 = in(reg) ttbr1,
         entry = in(reg) entry,
         in("x0") arg,
         options(noreturn),
     );
+}
+
+/// Make freshly-written code at `[base, base+len)` executable: clean the D-cache
+/// to the Point of Unification, then invalidate the I-cache. aarch64 I/D caches
+/// are **not** coherent, so a kernel image copied in via data stores must be
+/// synced before it is fetched or the CPU may execute stale bytes. (x86_64 needs
+/// no equivalent — its caches are architecturally coherent.)
+pub fn sync_instruction_cache(base: u64, len: u64) {
+    // SAFETY: cache-maintenance ops (`dc cvau` / `ic iallu`) over a range we own;
+    // they touch only cache state, never memory contents or safety invariants.
+    unsafe {
+        // D-cache minimum line size from CTR_EL0.DminLine (log2 of words).
+        let ctr: u64;
+        asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack));
+        let line = 4u64 << ((ctr >> 16) & 0xf);
+        let mut addr = base & !(line - 1);
+        let end = base + len;
+        while addr < end {
+            asm!("dc cvau, {}", in(reg) addr, options(nomem, nostack, preserves_flags));
+            addr += line;
+        }
+        asm!("dsb ish", options(nomem, nostack, preserves_flags));
+        asm!("ic iallu", options(nomem, nostack, preserves_flags)); // invalidate I-cache to PoU
+        asm!("dsb ish", options(nomem, nostack, preserves_flags));
+        asm!("isb", options(nomem, nostack, preserves_flags));
+    }
 }
 
 /// Halt the CPU forever (end-of-life and panic). Never returns.

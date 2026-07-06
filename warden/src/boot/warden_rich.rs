@@ -36,9 +36,12 @@ const HHDM_OFFSET: u64 = 0xffff_8000_0000_0000;
 /// How much low physical memory the identity map and HHDM cover (1 GiB pages).
 const IDENTITY_GIB: u64 = 4;
 
-// Page-table entry flags.
+// x86_64 page-table entry flags.
+#[cfg(target_arch = "x86_64")]
 const PRESENT: u64 = 1 << 0;
+#[cfg(target_arch = "x86_64")]
 const WRITABLE: u64 = 1 << 1;
+#[cfg(target_arch = "x86_64")]
 const HUGE: u64 = 1 << 7;
 
 /// Load and launch a warden-rich ELF kernel. Returns only on failure.
@@ -116,6 +119,10 @@ pub fn boot_warden_rich(entry: &Entry, config_bytes: &[u8]) -> Result<(), String
         // region; `src` is an in-bounds slice of the ELF buffer.
         unsafe { ptr::copy_nonoverlapping(src.as_ptr(), (kphys + off) as *mut u8, seg.file_size) };
     }
+    // aarch64's I/D caches are not coherent: the kernel image was just written via
+    // data stores, so sync it to the Point of Unification before it is executed.
+    #[cfg(target_arch = "aarch64")]
+    arch::sync_instruction_cache(kphys, region_len);
 
     // --- allocate handoff structures + page tables BEFORE ExitBootServices ---
     // Size the region array from the live map plus slack for the growth our own
@@ -126,7 +133,12 @@ pub fn boot_warden_rich(entry: &Entry, config_bytes: &[u8]) -> Result<(), String
     let bootinfo_phys = alloc_pages(1)?;
     let fb = framebuffer();
     let rsdp = rsdp();
-    let pml4 = build_page_tables(kphys, vbase, kernel_pages)?;
+    // The page-table format is the only arch-specific part of the build: x86_64
+    // returns one CR3 root; aarch64 returns (TTBR0 identity, TTBR1 HHDM+kernel).
+    #[cfg(target_arch = "x86_64")]
+    let root = build_page_tables(kphys, vbase, kernel_pages)?;
+    #[cfg(target_arch = "aarch64")]
+    let root = build_page_tables_aarch64(kphys, vbase, kernel_pages)?;
 
     // --- point of no return: exit boot services, then finish the handoff with
     //     NO allocation (only pointer writes + the returned map). ---
@@ -188,9 +200,16 @@ pub fn boot_warden_rich(entry: &Entry, config_bytes: &[u8]) -> Result<(), String
     log::info!("jumping to warden-rich kernel: entry={:#x} regions={count}", image.entry);
     // Pass the boot info as an HHDM-virtual pointer (kernel reads it via HHDM).
     let bootinfo_virt = bootinfo_phys + HHDM_OFFSET;
-    // SAFETY: the page tables map the current RIP (identity), the boot info
+    // SAFETY: the page tables map the current PC (identity), the boot info
     // (HHDM), and the kernel (its link address). Boot services are exited.
-    unsafe { arch::enter_kernel(pml4, image.entry, bootinfo_virt) }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        arch::enter_kernel(root, image.entry, bootinfo_virt)
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        arch::enter_kernel(root.0, root.1, image.entry, bootinfo_virt)
+    }
 }
 
 /// Allocate `n` zeroable pages, returning the (identity-mapped) physical base.
@@ -221,6 +240,7 @@ fn set_entry(table: u64, idx: u64, value: u64) {
 /// every long-mode CPU supports them, whereas 1 GiB pages require the CPUID
 /// `PDPE1GB` feature — the identity map underpins the trampoline itself, so it
 /// must never fault.
+#[cfg(target_arch = "x86_64")]
 fn build_page_tables(kphys: u64, vbase: u64, kernel_pages: u64) -> Result<u64, String> {
     let pml4 = alloc_table()?;
 
@@ -246,6 +266,7 @@ fn build_page_tables(kphys: u64, vbase: u64, kernel_pages: u64) -> Result<u64, S
 
 /// Map the low `IDENTITY_GIB` GiB of physical memory into `pml4[pml4_idx]` using
 /// 2 MiB pages (one PDPT + one PD per GiB).
+#[cfg(target_arch = "x86_64")]
 fn map_low_2mib(pml4: u64, pml4_idx: u64) -> Result<(), String> {
     let pdpt = alloc_table()?;
     for gib in 0..IDENTITY_GIB {
@@ -258,6 +279,93 @@ fn map_low_2mib(pml4: u64, pml4_idx: u64) -> Result<(), String> {
     }
     set_entry(pml4, pml4_idx, pdpt | PRESENT | WRITABLE);
     Ok(())
+}
+
+// aarch64 (VMSAv8-64, 4 KiB granule) page-table descriptor bits. Table/page
+// descriptors are `0b11`, block descriptors `0b01` (both set the valid bit).
+#[cfg(target_arch = "aarch64")]
+const A64_TABLE: u64 = 0b11;
+#[cfg(target_arch = "aarch64")]
+const A64_BLOCK: u64 = 0b01;
+#[cfg(target_arch = "aarch64")]
+const A64_AF: u64 = 1 << 10; // access flag (must be set or the access faults)
+#[cfg(target_arch = "aarch64")]
+const A64_SH_INNER: u64 = 0b11 << 8; // inner shareable
+#[cfg(target_arch = "aarch64")]
+const A64_ATTR_NORMAL: u64 = 0 << 2; // AttrIndx -> MAIR attr0 (Normal WB)
+#[cfg(target_arch = "aarch64")]
+const A64_ATTR_DEVICE: u64 = 1 << 2; // AttrIndx -> MAIR attr1 (Device nGnRnE)
+/// On the QEMU `virt` machine RAM begins at 1 GiB; everything below is MMIO
+/// (PL011, GIC, RTC, flash, ...) and must be mapped as Device memory.
+#[cfg(target_arch = "aarch64")]
+const A64_RAM_BASE: u64 = 0x4000_0000;
+
+#[cfg(target_arch = "aarch64")]
+fn a64_normal_block(pa: u64) -> u64 {
+    pa | A64_AF | A64_SH_INNER | A64_ATTR_NORMAL | A64_BLOCK
+}
+#[cfg(target_arch = "aarch64")]
+fn a64_device_block(pa: u64) -> u64 {
+    pa | A64_AF | A64_ATTR_DEVICE | A64_BLOCK
+}
+#[cfg(target_arch = "aarch64")]
+fn a64_normal_page(pa: u64) -> u64 {
+    pa | A64_AF | A64_SH_INNER | A64_ATTR_NORMAL | A64_TABLE
+}
+
+/// Build the aarch64 translation tables and return `(ttbr0, ttbr1)`.
+///
+/// * TTBR0 (low half): identity map of the low `IDENTITY_GIB` GiB via 2 MiB
+///   blocks — sub-`A64_RAM_BASE` as Device (so the kernel's PL011 MMIO works),
+///   RAM as Normal (the trampoline, page tables, and kernel image live here).
+/// * TTBR1 (high half): the HHDM at [`HHDM_OFFSET`] (Normal) plus the higher-half
+///   kernel mapped with 4 KiB pages. The two share a single L0 table at disjoint
+///   slots (256 for the HHDM, 511 for the kernel).
+#[cfg(target_arch = "aarch64")]
+fn build_page_tables_aarch64(kphys: u64, vbase: u64, kernel_pages: u64) -> Result<(u64, u64), String> {
+    // --- TTBR0: identity ---
+    let ttbr0 = alloc_table()?;
+    let l1_id = alloc_table()?;
+    set_entry(ttbr0, 0, l1_id | A64_TABLE);
+    for gib in 0..IDENTITY_GIB {
+        let l2 = alloc_table()?;
+        for j in 0..512u64 {
+            let pa = (gib << 30) | (j << 21);
+            let desc = if pa < A64_RAM_BASE { a64_device_block(pa) } else { a64_normal_block(pa) };
+            set_entry(l2, j, desc);
+        }
+        set_entry(l1_id, gib, l2 | A64_TABLE);
+    }
+
+    // --- TTBR1: HHDM (view of physical memory) ---
+    // Use the SAME Device/Normal split as the identity map: the sub-A64_RAM_BASE
+    // MMIO hole must stay Device here too, so we don't create a second, Normal-
+    // cacheable alias of device registers (which speculation could disturb).
+    let ttbr1 = alloc_table()?;
+    let l1_h = alloc_table()?;
+    set_entry(ttbr1, (HHDM_OFFSET >> 39) & 0x1ff, l1_h | A64_TABLE);
+    for gib in 0..IDENTITY_GIB {
+        let l2 = alloc_table()?;
+        for j in 0..512u64 {
+            let pa = (gib << 30) | (j << 21);
+            let desc = if pa < A64_RAM_BASE { a64_device_block(pa) } else { a64_normal_block(pa) };
+            set_entry(l2, j, desc);
+        }
+        set_entry(l1_h, gib, l2 | A64_TABLE);
+    }
+
+    // --- TTBR1: the higher-half kernel (4 KiB pages) ---
+    let l1_k = alloc_table()?;
+    let l2_k = alloc_table()?;
+    let l3_k = alloc_table()?;
+    for i in 0..kernel_pages {
+        set_entry(l3_k, i, a64_normal_page(kphys + i * PAGE));
+    }
+    set_entry(l2_k, (vbase >> 21) & 0x1ff, l3_k | A64_TABLE);
+    set_entry(l1_k, (vbase >> 30) & 0x1ff, l2_k | A64_TABLE);
+    set_entry(ttbr1, (vbase >> 39) & 0x1ff, l1_k | A64_TABLE);
+
+    Ok((ttbr0, ttbr1))
 }
 
 /// Map a UEFI memory type to the ABI's `MemoryKind`. Boot-services memory is

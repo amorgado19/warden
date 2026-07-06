@@ -106,6 +106,12 @@ fn main() {
         Some("test-a64") => {
             exit(if test_a64_smoke() { 0 } else { 1 });
         }
+        Some("test-a64-rich") => {
+            exit(if test_a64_rich() { 0 } else { 1 });
+        }
+        Some("test-a64-measured") => {
+            exit(if test_a64_measured() { 0 } else { 1 });
+        }
         Some("test-p6-rollback") => {
             build();
             stage();
@@ -576,28 +582,56 @@ fn resolve_aavmf(root: &Path) -> (String, String) {
     (code, vars.to_string_lossy().into_owned())
 }
 
-/// AC7.1 (P0/P1 on aarch64) — build + boot warden.efi under QEMU `virt` + AAVMF
-/// and assert the serial banner, the memory-map dump, and the menu render.
-fn test_a64_smoke() -> bool {
-    build_a64();
+/// Build the reference kernel for aarch64 and stage it into the aarch64 ESP.
+fn build_refkernel_a64() {
     let root = workspace_root();
-    std::fs::copy(root.join("fixtures/warden.toml"), root.join(ESP_A64).join("warden.toml")).expect("stage config");
-    let (code, vars) = resolve_aavmf(&root);
+    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    eprintln!("[xtask] building refkernel (aarch64-unknown-none)…");
+    let status = Command::new(&cargo)
+        .current_dir(&root)
+        // aarch64's tiny code model reaches the higher-half base via adrp/add; the
+        // x86-only `code-model=kernel` is dropped.
+        .env("RUSTFLAGS", "-C link-arg=-Trefkernel/linker.ld -C relocation-model=static")
+        .args(["build", "-p", "refkernel", "--release", "--target", "aarch64-unknown-none"])
+        .status()
+        .expect("failed to spawn cargo for aarch64 refkernel");
+    assert!(status.success(), "aarch64 refkernel build failed");
+    std::fs::copy(
+        root.join("target/aarch64-unknown-none/release/refkernel"),
+        root.join(ESP_A64).join("refkernel"),
+    )
+    .expect("stage aarch64 refkernel");
+}
 
+/// Stage a fixture config into the aarch64 ESP.
+fn stage_a64_config(config: &str) {
+    let root = workspace_root();
+    std::fs::copy(root.join("fixtures").join(config), root.join(ESP_A64).join("warden.toml")).expect("stage config");
+}
+
+/// Boot the (already-staged) aarch64 ESP under QEMU `virt` + AAVMF, capture the
+/// serial log, and assert the required / forbidden markers. aarch64 runs under
+/// slow TCG on an x86 host, hence the generous watchdog. `tpm` attaches an
+/// emulated TPM 2.0 (swtpm via `tpm-tis-device`) for measured-boot scenarios.
+fn run_a64(name: &str, secs: u64, tpm: bool, required: &[&str], forbidden: &[&str]) -> bool {
+    let root = workspace_root();
+    let (code, vars) = resolve_aavmf(&root);
+    let swtpm = if tpm { Some(start_swtpm(&root)) } else { None };
     let mut cmd = Command::new("qemu-system-aarch64");
     cmd.current_dir(&root)
         .args(["-machine", "virt", "-cpu", "cortex-a72", "-m", "512M"])
         .args(["-drive", &format!("if=pflash,format=raw,readonly=on,file={code}")])
         .args(["-drive", &format!("if=pflash,format=raw,file={vars}")])
         .args(["-drive", &format!("format=raw,file=fat:rw:{}", root.join(ESP_A64).display())])
-        .args(["-display", "none", "-serial", "stdio"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .stdin(Stdio::null());
+        .args(["-display", "none", "-serial", "stdio"]);
+    if let Some((_, sock)) = &swtpm {
+        cmd.args(["-chardev", &format!("socket,id=chrtpm,path={}", sock.display())])
+            .args(["-tpmdev", "emulator,id=tpm0,chardev=chrtpm"])
+            .args(["-device", "tpm-tis-device,tpmdev=tpm0"]);
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::inherit()).stdin(Stdio::null());
 
-    // aarch64 runs under slow TCG on an x86 host — give the memmap dump time.
-    let secs = 150;
-    eprintln!("[xtask] booting QEMU aarch64 (virt + AAVMF, watchdog {secs}s)…");
+    eprintln!("[xtask] booting QEMU aarch64 ({name}, virt + AAVMF{}, watchdog {secs}s)…", if tpm { " + swtpm" } else { "" });
     let mut child = cmd.spawn().expect("failed to spawn qemu-system-aarch64");
     let mut stdout = child.stdout.take().expect("piped stdout");
     let (tx, rx) = mpsc::channel();
@@ -607,19 +641,15 @@ fn test_a64_smoke() -> bool {
         let _ = tx.send(buf);
     });
     let _ = watch(&mut child, secs);
+    if let Some((mut tpm, _)) = swtpm {
+        let _ = tpm.kill();
+        let _ = tpm.wait();
+    }
     let buf = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
     let _ = reader.join();
     let log = String::from_utf8_lossy(&buf);
-    println!("----- captured serial (aarch64 smoke) -----\n{log}\n----- end serial -----");
+    println!("----- captured serial ({name}) -----\n{log}\n----- end serial -----");
 
-    let required = [
-        "[aarch64]",                   // P0: banner on the aarch64 PL011 serial
-        "UEFI memory map:",            // P0: memmap dump
-        "memory summary:",             // P0: summary
-        "=== Warden boot menu ===",    // P1: menu renders
-        "auto-boot 'demo'",            // P1: countdown
-    ];
-    let forbidden = ["WARDEN PANIC"];
     let mut ok = true;
     for m in required {
         let present = log.contains(m);
@@ -632,8 +662,59 @@ fn test_a64_smoke() -> bool {
             ok = false;
         }
     }
-    eprintln!("[xtask] scenario aarch64 smoke (AC7.1 P0/P1): {}", if ok { "PASS" } else { "FAIL" });
+    eprintln!("[xtask] scenario {name}: {}", if ok { "PASS" } else { "FAIL" });
     ok
+}
+
+/// AC7.1 (P0/P1 on aarch64) — banner, memory-map dump, and menu render.
+fn test_a64_smoke() -> bool {
+    build_a64();
+    stage_a64_config("warden.toml");
+    run_a64(
+        "aarch64 smoke (AC7.1 P0/P1)",
+        150,
+        false,
+        &["[aarch64]", "UEFI memory map:", "memory summary:", "=== Warden boot menu ===", "auto-boot 'demo'"],
+        &["WARDEN PANIC"],
+    )
+}
+
+/// AC7.1 (P3 on aarch64) — measured boot: run the rich handoff with an emulated
+/// TPM so `measure_and_gate` extends the PCRs and replays the event log. Verifies
+/// the measured-boot gate AND the P4 handoff together on aarch64.
+fn test_a64_measured() -> bool {
+    build_a64();
+    build_refkernel_a64();
+    stage_a64_config("warden-rich.toml");
+    run_a64(
+        "aarch64 measured + rich (AC7.1 P3/P4)",
+        150,
+        true,
+        &["MEASURED-BOOT GATE: PASS", "[refkernel] warden-rich kernel entered", "WARDEN-P4-KERNEL-OK"],
+        &["WARDEN PANIC", "MEASURED-BOOT GATE: FAIL", "[refkernel] FATAL"],
+    )
+}
+
+/// AC7.1 (P4 on aarch64) — the warden-rich custom handoff: Warden builds the
+/// aarch64 (VMSAv8) page tables, exits boot services, and jumps to the reference
+/// kernel, which validates the ABI contract and walks the memmap via the HHDM.
+fn test_a64_rich() -> bool {
+    build_a64();
+    build_refkernel_a64();
+    stage_a64_config("warden-rich.toml");
+    run_a64(
+        "aarch64 warden-rich (AC7.1 P4)",
+        150,
+        false,
+        &[
+            "jumping to warden-rich kernel",
+            "[refkernel] warden-rich kernel entered",
+            "[refkernel] CONTRACT OK",
+            "[refkernel] usable pages (walked via HHDM)",
+            "WARDEN-P4-KERNEL-OK",
+        ],
+        &["WARDEN PANIC", "[refkernel] FATAL"],
+    )
 }
 
 /// Build the bare-metal reference kernel ELF and stage it under test-assets.

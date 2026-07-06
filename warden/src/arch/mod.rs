@@ -16,7 +16,7 @@ pub use x86_64::serial_read_byte;
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
 #[cfg(target_arch = "aarch64")]
-pub use aarch64::{enter_kernel, halt, serial_init, serial_write_byte};
+pub use aarch64::{enter_kernel, halt, serial_init, serial_write_byte, sync_instruction_cache};
 #[cfg(target_arch = "aarch64")]
 #[allow(unused_imports)]
 pub use aarch64::serial_read_byte;

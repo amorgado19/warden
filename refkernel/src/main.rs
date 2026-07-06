@@ -2,38 +2,67 @@
 //!
 //! Warden loads this ELF higher-half, sets up identity + HHDM + kernel page
 //! tables, exits boot services, and jumps to `_start` with a pointer to
-//! [`WardenBootInfo`] in `rdi` (System V AMD64). We run post-ExitBootServices
-//! with no firmware services, so we drive COM1 directly. We validate the ABI
-//! contract, walk the memory map **via the HHDM** (proving the offset works),
-//! print what we received, and halt. This proves the handoff end-to-end.
+//! [`WardenBootInfo`] in the first-argument register (`rdi` on x86_64 / `x0` on
+//! aarch64 — the `extern "C"` ABI handles both). We run post-ExitBootServices
+//! with no firmware services, so we drive the platform UART directly (COM1 on
+//! x86_64, PL011 on the aarch64 QEMU `virt`). We validate the ABI contract, walk
+//! the memory map **via the HHDM** (proving the offset works), print what we
+//! received, and halt. This proves the handoff end-to-end on both arches.
 
 #![no_std]
 #![no_main]
 
-use core::arch::asm;
-
 use warden_abi::{MemoryKind, MemRegion, WardenBootInfo, WARDEN_ABI_VERSION, WARDEN_MAGIC};
 
-const COM1: u16 = 0x3F8;
-
-#[inline]
-unsafe fn outb(port: u16, val: u8) {
-    asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags));
-}
-#[inline]
-unsafe fn inb(port: u16) -> u8 {
-    let v: u8;
-    asm!("in al, dx", out("al") v, in("dx") port, options(nomem, nostack, preserves_flags));
-    v
-}
-
-fn putb(b: u8) {
-    // SAFETY: polling LSR + writing THR of COM1; no memory effects.
-    unsafe {
-        while inb(COM1 + 5) & 0x20 == 0 {}
-        outb(COM1, b);
+/// Arch-specific serial + halt. Everything else in this kernel is arch-generic.
+#[cfg(target_arch = "x86_64")]
+mod plat {
+    use core::arch::asm;
+    const COM1: u16 = 0x3F8;
+    /// SAFETY: writes THR / polls LSR of the COM1 UART; no memory effects.
+    pub fn putb(b: u8) {
+        unsafe {
+            loop {
+                let lsr: u8;
+                asm!("in al, dx", out("al") lsr, in("dx") COM1 + 5, options(nomem, nostack, preserves_flags));
+                if lsr & 0x20 != 0 {
+                    break;
+                }
+            }
+            asm!("out dx, al", in("dx") COM1, in("al") b, options(nomem, nostack, preserves_flags));
+        }
+    }
+    pub fn halt() -> ! {
+        loop {
+            // SAFETY: `hlt` only pauses the CPU; no memory effects.
+            unsafe { asm!("hlt", options(nomem, nostack, preserves_flags)) };
+        }
     }
 }
+
+#[cfg(target_arch = "aarch64")]
+mod plat {
+    use core::arch::asm;
+    use core::ptr::{read_volatile, write_volatile};
+    const PL011_DR: usize = 0x0900_0000;
+    const PL011_FR: usize = 0x0900_0018;
+    const FR_TXFF: u32 = 1 << 5;
+    /// SAFETY: MMIO to the PL011 register block (mapped Device by Warden's TTBR0).
+    pub fn putb(b: u8) {
+        unsafe {
+            while read_volatile(PL011_FR as *const u32) & FR_TXFF != 0 {}
+            write_volatile(PL011_DR as *mut u8, b);
+        }
+    }
+    pub fn halt() -> ! {
+        loop {
+            // SAFETY: `wfi` only pauses the CPU; no memory effects.
+            unsafe { asm!("wfi", options(nomem, nostack, preserves_flags)) };
+        }
+    }
+}
+
+use plat::{halt, putb};
 fn puts(s: &str) {
     for b in s.bytes() {
         if b == b'\n' {
@@ -143,11 +172,4 @@ extern "C" fn _start(bootinfo: *const WardenBootInfo) -> ! {
 fn panic(_: &core::panic::PanicInfo) -> ! {
     puts("[refkernel] PANIC\n");
     halt();
-}
-
-fn halt() -> ! {
-    loop {
-        // SAFETY: `hlt` pauses the CPU; no memory effects.
-        unsafe { asm!("hlt", options(nomem, nostack, preserves_flags)) };
-    }
 }
