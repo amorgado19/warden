@@ -15,6 +15,8 @@ mod boot;
 mod console;
 mod firmware;
 mod fs;
+mod measure;
+mod trust;
 
 use core::panic::PanicInfo;
 
@@ -56,6 +58,14 @@ fn efi_main() -> Status {
         "firmware revision: {:#010x}, UEFI revision: {}",
         uefi::system::firmware_revision(),
         uefi::system::uefi_revision()
+    );
+    log::info!(
+        "Secure Boot: {}",
+        if trust::secure_boot_enabled() {
+            "ENABLED (enforcing — unsigned entries refused)"
+        } else {
+            "disabled / setup mode"
+        }
     );
 
     let n = firmware::dump_memory_map();
@@ -124,7 +134,7 @@ fn boot_menu_phase() {
                 e.kernel
             );
             // Hands control to the kernel; only returns if the boot failed.
-            boot::boot_entry(&config, e);
+            boot::boot_entry(&config, &bytes, e);
             console::rescue::run(Some(&config), "the selected entry failed to boot");
         }
         console::menu::Choice::Rescue => {

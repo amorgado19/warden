@@ -1,0 +1,17 @@
+# P3 signature fixture (AC3.1). The entry carries a detached ed25519 signature
+# of the kernel; Warden verifies it against its embedded key before measuring or
+# loading. A tampered kernel/signature is refused (see the secure-bad test).
+
+[global]
+timeout = 1
+default = "arch"
+console = "serial"
+
+[[entry]]
+id        = "arch"
+title     = "Arch Linux (signed)"
+protocol  = "linux-efi"
+kernel    = "esp:/vmlinuz"
+initrd    = "esp:/initramfs.img"
+cmdline   = "console=ttyS0,115200 loglevel=7 warden_p2=cmdline_ok"
+signature = "esp:/vmlinuz.sig"

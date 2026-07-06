@@ -9,3 +9,5 @@ publish = false
 description = "Build/run/test helpers for Warden (host tool)."
 
 [dependencies]
+ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
+rand_core = "0.6"

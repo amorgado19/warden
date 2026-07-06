@@ -23,6 +23,7 @@ pub const CONFIG_PATH: &CStr16 = uefi::cstr16!("warden.toml");
 pub const MAX_CONFIG_BYTES: u64 = 1 << 20; //   1 MiB — warden.toml is tiny
 pub const MAX_KERNEL_BYTES: u64 = 64 << 20; //  64 MiB — a bzImage
 pub const MAX_INITRD_BYTES: u64 = 128 << 20; // 128 MiB — an initramfs
+pub const MAX_SIG_BYTES: u64 = 4096; //         4 KiB — a detached signature
 
 /// Read `warden.toml` from the ESP root.
 pub fn read_config() -> Result<Vec<u8>, String> {

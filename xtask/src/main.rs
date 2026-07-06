@@ -33,6 +33,11 @@ const DEFAULT_OVMF_CODE: &str = "/usr/share/edk2/x64/OVMF_CODE.4m.fd";
 const DEFAULT_OVMF_VARS_TEMPLATE: &str = "/usr/share/edk2/x64/OVMF_VARS.4m.fd";
 const DEFAULT_OVMF_VARS_LOCAL: &str = "OVMF_VARS.local.fd";
 
+/// Fixed **test** ed25519 seed → a deterministic keypair, so the public key
+/// embedded in Warden and the private key used to sign here always match without
+/// storing key files. NOT a production key.
+const SIGNING_SEED: [u8; 32] = *b"warden-p3-test-ed25519-seed-0001";
+
 /// Strings whose presence means the boot went wrong even if success markers also
 /// appear (memory-map dump failed, or the loader panicked).
 const FORBIDDEN: &[&str] = &["could not obtain UEFI memory map", "WARDEN PANIC"];
@@ -69,6 +74,37 @@ fn main() {
             build();
             stage();
             exit(if test_linux() { 0 } else { 1 });
+        }
+        Some("test-measured") => {
+            build();
+            stage();
+            exit(if test_measured() { 0 } else { 1 });
+        }
+        Some("pubkey") => print_pubkey(),
+        Some("sign-kernel") => sign_kernel(),
+        Some("sign-efi") => sign_efi(),
+        Some("test-secure-good") => {
+            build();
+            stage();
+            sign_kernel();
+            exit(if test_secure_good() { 0 } else { 1 });
+        }
+        Some("test-secure-bad") => {
+            build();
+            stage();
+            sign_kernel();
+            exit(if test_secure_bad() { 0 } else { 1 });
+        }
+        Some("test-p3") => {
+            build();
+            stage();
+            sign_kernel();
+            // The measured-boot replay+PCR gate is the hard blocker before P4.
+            let measured = test_measured();
+            let good = test_secure_good();
+            let bad = test_secure_bad();
+            eprintln!("[xtask] P3 results: measured-gate={measured} secure-good={good} secure-bad={bad}");
+            exit(if measured && good && bad { 0 } else { 1 });
         }
         Some("test-p1") => {
             build();
@@ -161,6 +197,7 @@ fn test_linux() -> bool {
         accel: true,
         stage: &[("vmlinuz", "vmlinuz"), ("initramfs.img", "initramfs.img")],
         kernel_owns_exit: true,
+        tpm: false, // boots without a TPM too (measured boot skips gracefully)
         input: None,
         required: &[
             "selected entry: arch",    // Warden picked the linux entry
@@ -177,6 +214,69 @@ fn test_linux() -> bool {
     })
 }
 
+/// AC3.2 + the hard gate before P4: with swtpm attached, Warden measures the
+/// components into PCRs, then the event log **replays to the same PCR values**
+/// (non-zero). Asserts the gate PASS marker.
+fn test_measured() -> bool {
+    run_scenario(Scenario {
+        name: "measured-boot (AC3.2 gate)",
+        secs: 90,
+        config: "warden-linux.toml",
+        mem: "512M",
+        accel: true,
+        stage: &[("vmlinuz", "vmlinuz"), ("initramfs.img", "initramfs.img")],
+        kernel_owns_exit: true,
+        tpm: true,
+        input: None,
+        required: &[
+            "Secure Boot: disabled", // SB-state read path is exercised
+            "MEASURE: PCR8 <- warden.config",
+            "MEASURE: PCR9 <- warden.kernel",
+            "REPLAY PCR8: MATCH",
+            "REPLAY PCR9: MATCH",
+            "MEASURED-BOOT GATE: PASS",
+            "WARDEN-P2-USERSPACE-OK", // still boots the kernel after measuring
+        ],
+        forbidden: &["WARDEN PANIC", "MEASURED-BOOT GATE: FAIL", "REPLAY PCR8: MISMATCH", "REPLAY PCR9: MISMATCH"],
+    })
+}
+
+/// AC3.1 (accept) — a validly-signed kernel passes verification and boots.
+fn test_secure_good() -> bool {
+    run_scenario(Scenario {
+        name: "secure-good (AC3.1 signed boots)",
+        secs: 90,
+        config: "warden-signed.toml",
+        mem: "512M",
+        accel: true,
+        stage: &[("vmlinuz", "vmlinuz"), ("initramfs.img", "initramfs.img"), ("vmlinuz.sig", "vmlinuz.sig")],
+        kernel_owns_exit: true,
+        tpm: false,
+        input: None,
+        required: &["signature OK", "Linux version 7.1.2", "WARDEN-P2-USERSPACE-OK"],
+        forbidden: &["WARDEN PANIC", "signature INVALID", "REFUSING"],
+    })
+}
+
+/// AC3.1 (refuse) — a tampered signature is refused with a clear message; the
+/// kernel is never loaded, and Warden drops to rescue without panicking.
+fn test_secure_bad() -> bool {
+    run_scenario(Scenario {
+        name: "secure-bad (AC3.1 tampered refused)",
+        secs: 30,
+        config: "warden-signed.toml",
+        mem: "512M",
+        accel: true,
+        // Stage the *bad* signature in place of the good one.
+        stage: &[("vmlinuz", "vmlinuz"), ("initramfs.img", "initramfs.img"), ("vmlinuz.sig.bad", "vmlinuz.sig")],
+        kernel_owns_exit: false,
+        tpm: false,
+        input: None,
+        required: &["signature INVALID", "REFUSING to boot", "WARDEN RESCUE"],
+        forbidden: &["WARDEN PANIC", "Linux version 7.1.2", "WARDEN-P2-USERSPACE-OK"],
+    })
+}
+
 struct Scenario {
     name: &'static str,
     secs: u64,
@@ -190,6 +290,8 @@ struct Scenario {
     /// If true, the guest (kernel) owns power: QEMU exiting is success, not a
     /// Warden reboot loop.
     kernel_owns_exit: bool,
+    /// Attach an emulated TPM 2.0 (swtpm) for measured-boot scenarios.
+    tpm: bool,
     /// Bytes to feed to the serial line once the menu is up (retried).
     input: Option<&'static [u8]>,
     required: &'static [&'static str],
@@ -213,6 +315,7 @@ const fn warden_scenario(
         accel: false,
         stage: &[],
         kernel_owns_exit: false,
+        tpm: false,
         input,
         required,
         forbidden,
@@ -227,10 +330,19 @@ fn run_scenario(s: Scenario) -> bool {
     }
 
     let root = workspace_root();
+
+    // Optional emulated TPM 2.0 (swtpm) for measured-boot scenarios.
+    let swtpm = if s.tpm { Some(start_swtpm(&root)) } else { None };
+
     let mut cmd = Command::new("qemu-system-x86_64");
     cmd.current_dir(&root).args(qemu_base_args(&root, s.mem));
     if s.accel {
         cmd.args(["-machine", "accel=kvm:tcg"]);
+    }
+    if let Some((_, sock)) = &swtpm {
+        cmd.args(["-chardev", &format!("socket,id=chrtpm,path={}", sock.display())])
+            .args(["-tpmdev", "emulator,id=tpm0,chardev=chrtpm"])
+            .args(["-device", "tpm-tis,tpmdev=tpm0"]);
     }
     cmd.args(["-display", "none", "-serial", "stdio"])
         .stdout(Stdio::piped())
@@ -284,6 +396,11 @@ fn run_scenario(s: Scenario) -> bool {
     }
 
     let outcome = watch(&mut child, secs);
+
+    if let Some((mut tpm, _)) = swtpm {
+        let _ = tpm.kill();
+        let _ = tpm.wait();
+    }
 
     let buf = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
     let _ = reader.join();
@@ -452,6 +569,138 @@ fn qemu_base_args(root: &Path, mem: &str) -> Vec<String> {
         mem.into(),
         "-no-reboot".into(),
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Signing (P3) — deterministic test keypair from SIGNING_SEED
+// ---------------------------------------------------------------------------
+
+fn signing_key() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&SIGNING_SEED)
+}
+
+/// Print the public key as a Rust const, to paste into `warden/src/trust`.
+fn print_pubkey() {
+    let pk = signing_key().verifying_key().to_bytes();
+    println!("pub const SIGNING_PUBKEY: [u8; 32] = [");
+    for row in pk.chunks(8) {
+        print!("   ");
+        for b in row {
+            print!(" 0x{b:02x},");
+        }
+        println!();
+    }
+    println!("];");
+}
+
+/// Sign `test-assets/vmlinuz` → `vmlinuz.sig` (valid) + `vmlinuz.sig.bad`
+/// (a valid signature with one byte flipped, for the tampered-refusal test).
+fn sign_kernel() {
+    use ed25519_dalek::Signer;
+    let root = workspace_root();
+    let kernel = std::fs::read(root.join("test-assets/vmlinuz")).unwrap_or_else(|e| {
+        eprintln!("[xtask] read test-assets/vmlinuz failed: {e} (download a kernel first)");
+        exit(1);
+    });
+    let sig = signing_key().sign(&kernel).to_bytes();
+    std::fs::write(root.join("test-assets/vmlinuz.sig"), sig).expect("write sig");
+    let mut bad = sig;
+    bad[0] ^= 0x01; // flip one byte → invalid signature
+    std::fs::write(root.join("test-assets/vmlinuz.sig.bad"), bad).expect("write bad sig");
+    eprintln!("[xtask] signed vmlinuz -> vmlinuz.sig (+ vmlinuz.sig.bad)");
+}
+
+/// Sign the staged `warden.efi` with a test db key (T3.5), demonstrating the
+/// Secure Boot signing story: firmware verifies Warden's PE signature against an
+/// enrolled db certificate. Generates a throwaway test cert if none exists,
+/// `sbsign`s the image, and `sbverify`s the result.
+fn sign_efi() {
+    build();
+    stage();
+    let root = workspace_root();
+    let ta = root.join("test-assets");
+    std::fs::create_dir_all(&ta).ok();
+    let key = ta.join("db.key");
+    let crt = ta.join("db.crt");
+
+    if !key.exists() || !crt.exists() {
+        let st = Command::new("openssl")
+            .args([
+                "req", "-new", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650",
+                "-subj", "/CN=Warden Test db/",
+                "-keyout", &key.to_string_lossy(),
+                "-out", &crt.to_string_lossy(),
+            ])
+            .status()
+            .expect("run openssl");
+        if !st.success() {
+            eprintln!("[xtask] openssl cert generation failed");
+            exit(1);
+        }
+    }
+
+    let efi = root.join(ESP_TARGET);
+    let signed = ta.join("BOOTX64.signed.efi");
+    let sign = Command::new("sbsign")
+        .args([
+            "--key", &key.to_string_lossy(),
+            "--cert", &crt.to_string_lossy(),
+            "--output", &signed.to_string_lossy(),
+            &efi.to_string_lossy(),
+        ])
+        .status()
+        .expect("run sbsign");
+    if !sign.success() {
+        eprintln!("[xtask] sbsign failed");
+        exit(1);
+    }
+    let verify = Command::new("sbverify")
+        .args(["--cert", &crt.to_string_lossy(), &signed.to_string_lossy()])
+        .status()
+        .expect("run sbverify");
+    if verify.success() {
+        eprintln!("[xtask] warden.efi signed + sbverify OK -> {}", signed.display());
+    } else {
+        eprintln!("[xtask] sbverify FAILED");
+        exit(1);
+    }
+}
+
+/// Start an emulated TPM 2.0 (swtpm) on a fresh state dir, returning the process
+/// handle and the control socket QEMU connects to. OVMF's TCG driver performs
+/// TPM2_Startup, so no swtpm_setup/manufacture is needed.
+fn start_swtpm(root: &Path) -> (Child, PathBuf) {
+    let dir = root.join("test-assets").join("tpm");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create tpm state dir");
+    let sock = dir.join("swtpm-sock");
+
+    let child = Command::new("swtpm")
+        .args([
+            "socket",
+            "--tpm2",
+            "--tpmstate",
+            &format!("dir={}", dir.display()),
+            "--ctrl",
+            &format!("type=unixio,path={}", sock.display()),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap_or_else(|e| {
+            eprintln!("[xtask] could not start swtpm ({e}) — is `swtpm` installed?");
+            exit(1);
+        });
+
+    // Wait for the control socket to appear before launching QEMU.
+    for _ in 0..100 {
+        if sock.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    eprintln!("[xtask] swtpm listening at {}", sock.display());
+    (child, sock)
 }
 
 /// Copy a built test asset (`test-assets/<src>`) onto the ESP as `<dst>`.

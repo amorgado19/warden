@@ -23,17 +23,69 @@ use uefi::Handle;
 use uefi_raw::protocol::loaded_image::LoadedImageProtocol;
 use warden_config::Entry;
 
-use crate::fs;
+use crate::{fs, measure, trust};
 
 mod initrd;
 
 /// Load and start the Linux kernel named by `entry`. Returns only on failure —
 /// a successful boot transfers control to the kernel and never comes back.
-pub fn boot_linux(entry: &Entry) -> Result<(), String> {
-    // Read the kernel image from the ESP. `LoadImage` copies the buffer, so it
-    // need not outlive the load call.
+pub fn boot_linux(entry: &Entry, config_bytes: &[u8]) -> Result<(), String> {
+    // Read the kernel + initrd from the ESP ONCE, so the exact bytes we measure
+    // and verify are the exact bytes we execute (no TOCTOU). `LoadImage` copies
+    // the kernel buffer, so it need not outlive the load call.
     let kernel = fs::read_path(&entry.kernel, fs::MAX_KERNEL_BYTES)?;
     log::info!("kernel '{}': {} bytes", entry.kernel, kernel.len());
+
+    let initrd = match entry.initrd.as_deref() {
+        Some(path) => {
+            let data = fs::read_path(path, fs::MAX_INITRD_BYTES)?;
+            log::info!("initrd '{path}': {} bytes", data.len());
+            Some(data)
+        }
+        None => {
+            log::info!("no initrd configured for '{}'", entry.id);
+            None
+        }
+    };
+
+    // Verify the kernel signature against Warden's embedded key BEFORE measuring
+    // or loading anything (IMP-006: verify → measure → execute). A bad signature
+    // is refused here; an unsigned entry is refused only when Secure Boot is on.
+    match entry.signature.as_deref() {
+        Some(sig_path) => {
+            let sig = fs::read_path(sig_path, fs::MAX_SIG_BYTES)?;
+            match trust::verify(&kernel, &sig) {
+                Ok(()) => log::info!("signature OK: '{}' verified against the embedded key", entry.kernel),
+                Err(e) => {
+                    return Err(format!("REFUSING to boot: kernel signature INVALID — {e}"));
+                }
+            }
+        }
+        None => {
+            if trust::secure_boot_enabled() {
+                return Err(format!(
+                    "REFUSING to boot unsigned entry '{}': Secure Boot is enabled",
+                    entry.id
+                ));
+            }
+            log::warn!("entry '{}' is unsigned and Secure Boot is off — booting unverified", entry.id);
+        }
+    }
+
+    let cmdline = entry.cmdline.as_deref().unwrap_or("");
+
+    // Measure the exact bytes we are about to trust, then self-verify the
+    // measured-boot chain (event log replays to the PCR values). Best-effort:
+    // absent a TPM this is skipped and the boot proceeds (measured boot is an
+    // integrity add-on, not a boot prerequisite in P3).
+    let outcome = measure::measure_and_gate(&measure::Inputs {
+        config: config_bytes,
+        entry_id: &entry.id,
+        cmdline,
+        kernel: &kernel,
+        initrd: initrd.as_deref(),
+    });
+    log::info!("measured boot: {outcome:?}");
 
     let image = boot::load_image(
         boot::image_handle(),
@@ -41,36 +93,27 @@ pub fn boot_linux(entry: &Entry) -> Result<(), String> {
     )
     .map_err(|e| format!("LoadImage failed: {e:?}"))?;
 
-    // Everything after this can fail; `run_loaded` only returns on failure, so
-    // unload the loaded image on the way out to avoid orphaning it in firmware
-    // memory (a successful boot never returns from `run_loaded`).
-    let outcome = run_loaded(image, entry);
+    // `run_loaded` only returns on failure; unload the image on the way out so a
+    // failed boot doesn't orphan it in firmware memory.
+    let result = run_loaded(image, cmdline, initrd);
     let _ = boot::unload_image(image);
-    outcome
+    result
 }
 
 /// Set the cmdline + initrd on the already-loaded `image`, then `StartImage`.
 /// Returns `Err` only if the boot failed; a successful boot never returns.
-fn run_loaded(image: Handle, entry: &Entry) -> Result<(), String> {
+fn run_loaded(image: Handle, cmdline: &str, initrd: Option<Vec<u8>>) -> Result<(), String> {
     // Command line via LoadOptions (UCS-2). `cmdline16` MUST stay alive across
     // StartImage — the stub reads it during boot.
-    let cmdline = entry.cmdline.as_deref().unwrap_or("");
     let cmdline16: Vec<u16> = cmdline.encode_utf16().chain(core::iter::once(0)).collect();
     set_load_options(image, &cmdline16)?;
     log::info!("cmdline: {cmdline:?}");
 
     // Optional initrd, exposed to the stub via the initrd-media LOAD_FILE2
     // protocol. The registration must stay alive across StartImage.
-    let _initrd_guard = match entry.initrd.as_deref() {
-        Some(path) => {
-            let data = fs::read_path(path, fs::MAX_INITRD_BYTES)?;
-            log::info!("initrd '{path}': {} bytes", data.len());
-            Some(initrd::register(data)?)
-        }
-        None => {
-            log::info!("no initrd configured for '{}'", entry.id);
-            None
-        }
+    let _initrd_guard = match initrd {
+        Some(data) => Some(initrd::register(data)?),
+        None => None,
     };
 
     log::info!("starting Linux EFI stub — it performs ExitBootServices and takes over the machine");
