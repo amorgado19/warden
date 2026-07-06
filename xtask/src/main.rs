@@ -100,6 +100,30 @@ fn main() {
             stage();
             exit(if test_btrfs_corrupt() { 0 } else { 1 });
         }
+        Some("test-p6-rollback") => {
+            build();
+            stage();
+            exit(if test_p6_rollback() { 0 } else { 1 });
+        }
+        Some("test-p6-confirm") => {
+            build();
+            stage();
+            exit(if test_p6_confirm() { 0 } else { 1 });
+        }
+        Some("test-p6-fault") => {
+            build();
+            stage();
+            exit(if test_p6_faultinject() { 0 } else { 1 });
+        }
+        Some("test-p6") => {
+            build();
+            stage();
+            let rb = test_p6_rollback();
+            let cf = test_p6_confirm();
+            let fi = test_p6_faultinject();
+            eprintln!("[xtask] P6 results: rollback(AC6.1)={rb} confirm={cf} fault-inject(AC6.2)={fi}");
+            exit(if rb && cf && fi { 0 } else { 1 });
+        }
         Some("test-p5") => {
             build();
             stage();
@@ -381,6 +405,127 @@ fn corrupt_btrfs_metadata() {
     }
     std::fs::write(&dst, &data).expect("write btrfs-bad.img");
     eprintln!("[xtask] wrote corrupted btrfs-bad.img (flipped a chunk-tree metadata byte)");
+}
+
+// ---------------------------------------------------------------------------
+// P6 — A/B boot assessment test plumbing
+// ---------------------------------------------------------------------------
+
+fn mk_record(active: &str, lkg: &str, tries: u32, max: u32, gen: u64) -> warden_assess::StateRecord {
+    warden_assess::StateRecord {
+        generation: gen,
+        active: warden_assess::id_from_str(active).expect("id fits"),
+        last_known_good: warden_assess::id_from_str(lkg).expect("id fits"),
+        tries_remaining: tries,
+        max_tries: max,
+    }
+}
+
+/// Write `test-assets/state.img`: LBA0 header + double-buffered records at LBA1/2.
+fn seed_state_disk(records: &[(usize, warden_assess::StateRecord)]) {
+    let ta = workspace_root().join("test-assets");
+    std::fs::create_dir_all(&ta).ok();
+    let mut img = vec![0u8; 1 << 20]; // 1 MiB, 512-byte sectors
+    img[0..8].copy_from_slice(b"WARDNDSK");
+    for (slot, rec) in records {
+        let bytes = rec.encode();
+        let off = 512 * (1 + slot);
+        img[off..off + bytes.len()].copy_from_slice(&bytes);
+    }
+    std::fs::write(ta.join("state.img"), &img).expect("write state.img");
+    eprintln!("[xtask] seeded state.img ({} record(s))", records.len());
+}
+
+/// Corrupt one state record in place — simulates a torn write to that buffer.
+fn corrupt_state_slot(slot: usize) {
+    let p = workspace_root().join("test-assets/state.img");
+    let mut img = std::fs::read(&p).expect("read state.img");
+    let off = 512 * (1 + slot) + 20; // a payload byte inside the record
+    img[off] ^= 0xff;
+    std::fs::write(&p, &img).expect("write state.img");
+    eprintln!("[xtask] corrupted state.img slot {slot} (simulated torn write)");
+}
+
+/// Delete the writable OVMF vars so the next boot starts from fresh NVRAM (no
+/// stale `WardenConfirm` leaking across independent P6 tests).
+fn reset_ovmf_vars() {
+    let _ = std::fs::remove_file(workspace_root().join(DEFAULT_OVMF_VARS_LOCAL));
+}
+
+/// One power cycle: boot warden-ab.toml with the (persistent) state disk attached.
+fn p6_cycle(name: &'static str, required: &'static [&'static str], forbidden: &'static [&'static str]) -> bool {
+    run_scenario(Scenario {
+        name,
+        secs: 90,
+        config: "warden-ab.toml",
+        mem: "512M",
+        accel: true,
+        stage: &[("vmlinuz", "vmlinuz"), ("initramfs.img", "initramfs.img")],
+        kernel_owns_exit: true,
+        tpm: false,
+        disks: &["state.img"],
+        input: None,
+        required,
+        forbidden,
+    })
+}
+
+/// AC6.1 — a slot that never confirms auto-rolls-back after max_tries, no console.
+fn test_p6_rollback() -> bool {
+    reset_ovmf_vars();
+    seed_state_disk(&[(0, mk_record("bad", "good", 2, 2, 1))]);
+    let c1 = p6_cycle(
+        "P6 AC6.1 cycle 1/3 — attempt bad",
+        &["assess: Attempt", "boot 'bad'", "WARDEN-P2-USERSPACE-OK"],
+        &["WARDEN PANIC", "assess: Rollback", "WARDEN-CONFIRM-SET"],
+    );
+    let c2 = p6_cycle(
+        "P6 AC6.1 cycle 2/3 — attempt bad",
+        &["assess: Attempt", "boot 'bad'"],
+        &["WARDEN PANIC", "assess: Rollback"],
+    );
+    let c3 = p6_cycle(
+        "P6 AC6.1 cycle 3/3 — auto rollback to good",
+        &["assess: Rollback", "boot 'good'", "WARDEN-P2-USERSPACE-OK", "WARDEN-CONFIRM-SET"],
+        &["WARDEN PANIC"],
+    );
+    let ok = c1 && c2 && c3;
+    eprintln!("[xtask] P6 AC6.1 (auto-rollback, no console): {}", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// The healthy path: an unconfirmed attempt that then confirms is marked good.
+fn test_p6_confirm() -> bool {
+    reset_ovmf_vars();
+    seed_state_disk(&[(0, mk_record("good", "good", 2, 2, 1))]);
+    let c1 = p6_cycle(
+        "P6 confirm 1/2 — attempt good (sets signal)",
+        &["assess: Attempt", "boot 'good'", "WARDEN-CONFIRM-SET"],
+        &["WARDEN PANIC", "assess: Rollback"],
+    );
+    let c2 = p6_cycle(
+        "P6 confirm 2/2 — signal consumed, marked good",
+        &["assess: Confirm", "boot 'good'"],
+        &["WARDEN PANIC", "assess: Rollback"],
+    );
+    let ok = c1 && c2;
+    eprintln!("[xtask] P6 confirm (success signal marks last-known-good): {}", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// AC6.2 — a torn write to one buffer leaves a valid old state; no brick.
+fn test_p6_faultinject() -> bool {
+    reset_ovmf_vars();
+    // slot0 = older valid (gen1), slot1 = newer valid (gen2); then tear slot1.
+    seed_state_disk(&[(0, mk_record("good", "good", 2, 2, 1)), (1, mk_record("good", "good", 1, 2, 2))]);
+    corrupt_state_slot(1);
+    let ok = p6_cycle(
+        "P6 AC6.2 — torn buffer, fall back to valid old state (no brick)",
+        &["assess: Attempt", "boot 'good'", "WARDEN-P2-USERSPACE-OK"],
+        &["WARDEN PANIC", "no Warden state disk"],
+    );
+    eprintln!("[xtask] P6 AC6.2 (fault-injection, no brick): {}", if ok { "PASS" } else { "FAIL" });
+    ok
 }
 
 /// Build the bare-metal reference kernel ELF and stage it under test-assets.

@@ -406,11 +406,16 @@ dependencies = [
  "uefi",
  "uefi-raw",
  "warden-abi",
+ "warden-assess",
  "warden-config",
 ]
 
 [[package]]
 name = "warden-abi"
+version = "0.1.0"
+
+[[package]]
+name = "warden-assess"
 version = "0.1.0"
 
 [[package]]
@@ -429,6 +434,7 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "rand_core",
+ "warden-assess",
 ]
 
 [[package]]

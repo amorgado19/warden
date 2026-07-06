@@ -1,0 +1,11 @@
+[package]
+name = "warden-assess"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Warden A/B boot assessment: durable state record codec + rollback logic (no_std, host-testable)."
+
+[dependencies]

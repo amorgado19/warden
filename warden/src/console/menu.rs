@@ -24,11 +24,11 @@ const TICK_MS: u64 = 50;
 
 /// Render the menu and run the selection loop until the operator chooses or the
 /// countdown elapses. Never returns until a choice is made.
-pub fn run(config: &Config) -> Choice {
+pub fn run(config: &Config, banner: Option<&str>) -> Choice {
     let mode = config.global.console;
     let n = config.entries.len();
     let mut sel = config.default_index();
-    render(config, sel);
+    render(config, sel, banner);
 
     // Countdown in ms; `None` == wait forever (timeout == 0).
     let mut remaining: Option<i64> = match config.global.timeout {
@@ -51,12 +51,12 @@ pub fn run(config: &Config) -> Choice {
             match key {
                 Key::Up => {
                     sel = (sel + n - 1) % n;
-                    render(config, sel);
+                    render(config, sel, banner);
                     status(config, None);
                 }
                 Key::Down => {
                     sel = (sel + 1) % n;
-                    render(config, sel);
+                    render(config, sel, banner);
                     status(config, None);
                 }
                 Key::Digit(d) => {
@@ -91,9 +91,13 @@ pub fn run(config: &Config) -> Choice {
     }
 }
 
-fn render(config: &Config, sel: usize) {
+fn render(config: &Config, sel: usize, banner: Option<&str>) {
     let mut s = String::new();
     s.push_str("\n=== Warden boot menu ===\n");
+    if let Some(b) = banner {
+        // T6.4: expose the A/B slot / tries state to the operator.
+        let _ = write!(s, "{b}\n");
+    }
     for (i, e) in config.entries.iter().enumerate() {
         let marker = if i == sel { '>' } else { ' ' };
         let default_tag = if e.id == config.global.default { "  (default)" } else { "" };

@@ -403,6 +403,19 @@ impl Parser {
             });
         }
 
+        // Cap id length: entry ids double as A/B slot ids, stored in a 32-byte
+        // on-disk field (must match `warden_assess::ID_LEN`). A longer id could
+        // never be confirmed, so reject it up front rather than silently truncate.
+        for e in &entries {
+            if e.id.len() > 32 {
+                return Err(ConfigError::global(format!(
+                    "entry id `{}` is {} bytes; the maximum is 32 (A/B slot-id limit)",
+                    e.id,
+                    e.id.len()
+                )));
+            }
+        }
+
         // Reject duplicate ids — otherwise `default` and menu selection are ambiguous.
         for i in 0..entries.len() {
             for j in (i + 1)..entries.len() {

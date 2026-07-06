@@ -1,0 +1,33 @@
+# P6 A/B fixture (AC6.1/AC6.2). Two slots share one vmlinuz+initramfs; they
+# differ only in id/title/cmdline. The "good" slot confirms itself via
+# `warden_confirm=good` (init.c sets the WardenConfirm UEFI var); the "bad" slot
+# never confirms, so unconfirmed attempts count down and roll back.
+#
+# The durable {active_slot, tries_remaining, last_known_good} state lives on a
+# separate raw state disk (LBA0 header + two CRC'd, double-buffered records),
+# seeded/inspected by xtask — not in this file.
+
+[global]
+timeout = 1
+default = "good"
+console = "serial"
+
+[assess]
+enabled   = true
+max_tries = 2
+
+[[entry]]
+id       = "good"
+title    = "Slot A — good (confirms)"
+protocol = "linux-efi"
+kernel   = "esp:/vmlinuz"
+initrd   = "esp:/initramfs.img"
+cmdline  = "console=ttyS0,115200 loglevel=4 warden_confirm=good"
+
+[[entry]]
+id       = "bad"
+title    = "Slot B — bad (never confirms)"
+protocol = "linux-efi"
+kernel   = "esp:/vmlinuz"
+initrd   = "esp:/initramfs.img"
+cmdline  = "console=ttyS0,115200 loglevel=4"

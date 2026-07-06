@@ -11,6 +11,7 @@
 extern crate alloc;
 
 mod arch;
+mod assess;
 mod boot;
 mod console;
 mod firmware;
@@ -105,7 +106,7 @@ fn boot_menu_phase() {
         }
     };
 
-    let config = match warden_config::parse(text) {
+    let mut config = match warden_config::parse(text) {
         Ok(c) => c,
         Err(e) => {
             // Readable error + rescue prompt, no crash (AC1.3).
@@ -123,7 +124,36 @@ fn boot_menu_phase() {
         config.global.timeout
     );
 
-    match console::menu::run(&config) {
+    // P6: A/B boot assessment. When enabled + a state disk is present, the
+    // decision (attempt / rollback / confirm) is persisted and the chosen slot
+    // becomes the menu default so it auto-boots headlessly (AC6.1).
+    let mut assess_banner = None;
+    let assess_active = match assess::run(&config) {
+        Some(outcome) => {
+            if config.entries.iter().any(|e| e.id == outcome.boot_id) {
+                config.global.default = outcome.boot_id.clone();
+                assess_banner = Some(format!(
+                    "A/B: {:?} — active='{}' good='{}' tries={}/{}",
+                    outcome.action, outcome.active, outcome.last_known_good, outcome.tries_remaining, outcome.max_tries
+                ));
+                true
+            } else {
+                log::error!("assess: chosen slot '{}' is not a config entry — ignoring", outcome.boot_id);
+                false
+            }
+        }
+        None => false,
+    };
+
+    // Auto-rollback must be headless (AC6.1). A `timeout = 0` config makes the
+    // menu wait forever for a keypress, which would strand the state machine —
+    // force a finite countdown while assessing.
+    if assess_active && config.global.timeout == 0 {
+        log::warn!("assess: timeout=0 would block headless rollback — using a 5s countdown");
+        config.global.timeout = 5;
+    }
+
+    match console::menu::run(&config, assess_banner.as_deref()) {
         console::menu::Choice::Boot(i) => {
             let e = &config.entries[i];
             log::info!(
@@ -135,6 +165,14 @@ fn boot_menu_phase() {
             );
             // Hands control to the kernel; only returns if the boot failed.
             boot::boot_entry(&config, &bytes, e);
+            // Boot failed. In assess mode the attempt is already recorded, so
+            // reboot to advance the state machine (never block on a console —
+            // AC6.1); otherwise fall to the interactive rescue prompt.
+            if assess_active {
+                log::error!("assess: boot of '{}' failed — rebooting to advance the A/B state machine", e.id);
+                uefi::boot::stall(core::time::Duration::from_secs(2));
+                uefi::runtime::reset(uefi::runtime::ResetType::COLD, uefi::Status::ABORTED, None);
+            }
             console::rescue::run(Some(&config), "the selected entry failed to boot");
         }
         console::menu::Choice::Rescue => {
