@@ -1,0 +1,15 @@
+# P5 btrfs fixture (AC5.2). The kernel is read from an attached btrfs volume,
+# with CRC32C verification of every metadata block.
+
+[global]
+timeout = 1
+default = "arch"
+console = "serial"
+
+[[entry]]
+id       = "arch"
+title    = "Arch Linux (kernel from btrfs)"
+protocol = "linux-efi"
+kernel   = "btrfs:/boot/vmlinuz"
+initrd   = "esp:/initramfs.img"
+cmdline  = "console=ttyS0,115200 loglevel=7 warden_p5=btrfs_ok"

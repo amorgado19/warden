@@ -11,6 +11,10 @@ use alloc::vec::Vec;
 
 use uefi::{CStr16, CString16};
 
+mod block;
+mod btrfs;
+mod ext4;
+
 /// Config file, at the root of the ESP Warden was loaded from.
 pub const CONFIG_PATH: &CStr16 = uefi::cstr16!("warden.toml");
 
@@ -30,15 +34,38 @@ pub fn read_config() -> Result<Vec<u8>, String> {
     read_esp_file(CONFIG_PATH, MAX_CONFIG_BYTES)
 }
 
-/// Read a file named by a config path scheme (e.g. `esp:/boot/vmlinuz`).
+/// Read a file named by a config path scheme:
+///   * `esp:/path`   — the FAT ESP via the firmware Simple File System
+///   * `ext4:/path`  — a read-only ext4 volume on an attached disk
+///   * `btrfs:/path` or `btrfs:@sub/path` — a read-only btrfs subvolume
 ///
-/// Only the `esp:` scheme is understood in P2; anything else is a clear error
-/// (ext4/btrfs land in P5). `max_bytes` bounds the allocation.
+/// `max_bytes` bounds the returned file.
 pub fn read_path(scheme_path: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
-    let rel = scheme_path
-        .strip_prefix("esp:")
-        .ok_or_else(|| format!("unsupported path scheme in '{scheme_path}' (only esp: is supported until P5)"))?;
+    if let Some(rel) = scheme_path.strip_prefix("esp:") {
+        return read_esp_scheme(rel, scheme_path, max_bytes);
+    }
+    if let Some(rel) = scheme_path.strip_prefix("ext4:") {
+        let disk = block::find_disk(ext4::probe)?;
+        let data = ext4::read_file(&disk, rel)?;
+        return cap(data, max_bytes, scheme_path);
+    }
+    if let Some(rel) = scheme_path.strip_prefix("btrfs:") {
+        let disk = block::find_disk(btrfs::probe)?;
+        let data = btrfs::read_file(&disk, rel)?;
+        return cap(data, max_bytes, scheme_path);
+    }
+    Err(format!("unsupported path scheme in '{scheme_path}' (want esp:/ ext4:/ btrfs:/)"))
+}
 
+fn cap(data: Vec<u8>, max_bytes: u64, path: &str) -> Result<Vec<u8>, String> {
+    if data.len() as u64 > max_bytes {
+        return Err(format!("{path} is {} bytes, over the {max_bytes}-byte limit", data.len()));
+    }
+    Ok(data)
+}
+
+/// Resolve an `esp:` path to the firmware FAT volume.
+fn read_esp_scheme(rel: &str, full: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
     // Normalise to a UEFI relative path: drop the leading slash, and use `\`
     // separators, which the firmware file system expects.
     let rel = rel.trim_start_matches('/');
@@ -47,11 +74,10 @@ pub fn read_path(scheme_path: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
         winpath.push(if c == '/' { '\\' } else { c });
     }
     if winpath.is_empty() {
-        return Err(format!("empty path in '{scheme_path}'"));
+        return Err(format!("empty path in '{full}'"));
     }
-
     let cpath =
-        CString16::try_from(winpath.as_str()).map_err(|_| format!("invalid characters in path '{scheme_path}'"))?;
+        CString16::try_from(winpath.as_str()).map_err(|_| format!("invalid characters in path '{full}'"))?;
     read_esp_file(&cpath, max_bytes)
 }
 

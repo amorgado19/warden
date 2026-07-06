@@ -1,0 +1,15 @@
+# P5 ext4 fixture (AC5.1). The kernel is read from an attached ext4 volume
+# (not the ESP); the initramfs stays on the ESP.
+
+[global]
+timeout = 1
+default = "arch"
+console = "serial"
+
+[[entry]]
+id       = "arch"
+title    = "Arch Linux (kernel from ext4)"
+protocol = "linux-efi"
+kernel   = "ext4:/boot/vmlinuz"
+initrd   = "esp:/initramfs.img"
+cmdline  = "console=ttyS0,115200 loglevel=7 warden_p5=ext4_ok"

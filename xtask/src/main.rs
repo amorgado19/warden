@@ -85,6 +85,30 @@ fn main() {
             stage();
             exit(if test_rich() { 0 } else { 1 });
         }
+        Some("test-ext4") => {
+            build();
+            stage();
+            exit(if test_ext4() { 0 } else { 1 });
+        }
+        Some("test-btrfs") => {
+            build();
+            stage();
+            exit(if test_btrfs() { 0 } else { 1 });
+        }
+        Some("test-btrfs-corrupt") => {
+            build();
+            stage();
+            exit(if test_btrfs_corrupt() { 0 } else { 1 });
+        }
+        Some("test-p5") => {
+            build();
+            stage();
+            let ext4 = test_ext4();
+            let btrfs = test_btrfs();
+            let corrupt = test_btrfs_corrupt();
+            eprintln!("[xtask] P5 results: ext4={ext4} btrfs={btrfs} btrfs-corrupt={corrupt}");
+            exit(if ext4 && btrfs && corrupt { 0 } else { 1 });
+        }
         Some("pubkey") => print_pubkey(),
         Some("sign-kernel") => sign_kernel(),
         Some("sign-efi") => sign_efi(),
@@ -203,6 +227,7 @@ fn test_linux() -> bool {
         stage: &[("vmlinuz", "vmlinuz"), ("initramfs.img", "initramfs.img")],
         kernel_owns_exit: true,
         tpm: false, // boots without a TPM too (measured boot skips gracefully)
+        disks: &[],
         input: None,
         required: &[
             "selected entry: arch",    // Warden picked the linux entry
@@ -232,6 +257,7 @@ fn test_measured() -> bool {
         stage: &[("vmlinuz", "vmlinuz"), ("initramfs.img", "initramfs.img")],
         kernel_owns_exit: true,
         tpm: true,
+        disks: &[],
         input: None,
         required: &[
             "Secure Boot: disabled", // SB-state read path is exercised
@@ -262,6 +288,7 @@ fn test_rich() -> bool {
         stage: &[("refkernel", "refkernel")],
         kernel_owns_exit: false, // the ref kernel halts; QEMU still running == clean
         tpm: false,
+        disks: &[],
         input: None,
         required: &[
             "jumping to warden-rich kernel",
@@ -273,6 +300,87 @@ fn test_rich() -> bool {
         ],
         forbidden: &["WARDEN PANIC", "[refkernel] FATAL", "[refkernel] PANIC"],
     })
+}
+
+/// AC5.1 — boot a kernel read from an attached **ext4** volume.
+fn test_ext4() -> bool {
+    run_scenario(Scenario {
+        name: "ext4 (AC5.1)",
+        secs: 90,
+        config: "warden-ext4.toml",
+        mem: "512M",
+        accel: true,
+        stage: &[("initramfs.img", "initramfs.img")], // kernel comes from ext4, not the ESP
+        kernel_owns_exit: true,
+        tpm: false,
+        disks: &["ext4.img"],
+        input: None,
+        required: &[
+            "Linux version 7.1.2",
+            "Command line: console=ttyS0,115200 loglevel=7 warden_p5=ext4_ok",
+            "WARDEN-P2-USERSPACE-OK",
+        ],
+        forbidden: &["WARDEN PANIC", "no matching filesystem"],
+    })
+}
+
+/// AC5.2 (good) — boot a kernel read from an attached **btrfs** volume, with
+/// CRC32C verification of every metadata block passing.
+fn test_btrfs() -> bool {
+    run_scenario(Scenario {
+        name: "btrfs (AC5.2 good)",
+        secs: 90,
+        config: "warden-btrfs.toml",
+        mem: "512M",
+        accel: true,
+        stage: &[("initramfs.img", "initramfs.img")],
+        kernel_owns_exit: true,
+        tpm: false,
+        disks: &["btrfs.img"],
+        input: None,
+        required: &[
+            "Linux version 7.1.2",
+            "Command line: console=ttyS0,115200 loglevel=7 warden_p5=btrfs_ok",
+            "WARDEN-P2-USERSPACE-OK",
+        ],
+        forbidden: &["WARDEN PANIC", "CRC32C mismatch", "no matching filesystem"],
+    })
+}
+
+/// AC5.2 (reject) — a btrfs image with a corrupted metadata block is refused
+/// (CRC32C mismatch), not silently used; Warden drops to rescue without a panic.
+fn test_btrfs_corrupt() -> bool {
+    corrupt_btrfs_metadata();
+    run_scenario(Scenario {
+        name: "btrfs-corrupt (AC5.2 reject)",
+        secs: 30,
+        config: "warden-btrfs.toml",
+        mem: "512M",
+        accel: true,
+        stage: &[("initramfs.img", "initramfs.img")],
+        kernel_owns_exit: false,
+        tpm: false,
+        disks: &["btrfs-bad.img"],
+        input: None,
+        required: &["CRC32C mismatch", "REFUSING", "WARDEN RESCUE"],
+        forbidden: &["WARDEN PANIC", "Linux version 7.1.2", "WARDEN-P2-USERSPACE-OK"],
+    })
+}
+
+/// Copy btrfs.img -> btrfs-bad.img and flip a byte inside the chunk-tree node
+/// (physical 0x1500000, in its checksummed region) so its CRC32C no longer matches.
+fn corrupt_btrfs_metadata() {
+    let ta = workspace_root().join("test-assets");
+    let src = ta.join("btrfs.img");
+    let dst = ta.join("btrfs-bad.img");
+    std::fs::copy(&src, &dst).expect("copy btrfs.img");
+    let mut data = std::fs::read(&dst).expect("read btrfs-bad.img");
+    let off = 0x150_0000 + 200; // inside the chunk-tree node, past its 32-byte csum
+    if off < data.len() {
+        data[off] ^= 0xff;
+    }
+    std::fs::write(&dst, &data).expect("write btrfs-bad.img");
+    eprintln!("[xtask] wrote corrupted btrfs-bad.img (flipped a chunk-tree metadata byte)");
 }
 
 /// Build the bare-metal reference kernel ELF and stage it under test-assets.
@@ -310,6 +418,7 @@ fn test_secure_good() -> bool {
         stage: &[("vmlinuz", "vmlinuz"), ("initramfs.img", "initramfs.img"), ("vmlinuz.sig", "vmlinuz.sig")],
         kernel_owns_exit: true,
         tpm: false,
+        disks: &[],
         input: None,
         required: &["signature OK", "Linux version 7.1.2", "WARDEN-P2-USERSPACE-OK"],
         forbidden: &["WARDEN PANIC", "signature INVALID", "REFUSING"],
@@ -329,6 +438,7 @@ fn test_secure_bad() -> bool {
         stage: &[("vmlinuz", "vmlinuz"), ("initramfs.img", "initramfs.img"), ("vmlinuz.sig.bad", "vmlinuz.sig")],
         kernel_owns_exit: false,
         tpm: false,
+        disks: &[],
         input: None,
         required: &["signature INVALID", "REFUSING to boot", "WARDEN RESCUE"],
         forbidden: &["WARDEN PANIC", "Linux version 7.1.2", "WARDEN-P2-USERSPACE-OK"],
@@ -350,6 +460,8 @@ struct Scenario {
     kernel_owns_exit: bool,
     /// Attach an emulated TPM 2.0 (swtpm) for measured-boot scenarios.
     tpm: bool,
+    /// Extra raw disks (test-assets basenames) to attach — e.g. an ext4/btrfs image.
+    disks: &'static [&'static str],
     /// Bytes to feed to the serial line once the menu is up (retried).
     input: Option<&'static [u8]>,
     required: &'static [&'static str],
@@ -374,6 +486,7 @@ const fn warden_scenario(
         stage: &[],
         kernel_owns_exit: false,
         tpm: false,
+        disks: &[],
         input,
         required,
         forbidden,
@@ -401,6 +514,10 @@ fn run_scenario(s: Scenario) -> bool {
         cmd.args(["-chardev", &format!("socket,id=chrtpm,path={}", sock.display())])
             .args(["-tpmdev", "emulator,id=tpm0,chardev=chrtpm"])
             .args(["-device", "tpm-tis,tpmdev=tpm0"]);
+    }
+    for disk in s.disks {
+        let path = root.join("test-assets").join(disk);
+        cmd.args(["-drive", &format!("format=raw,file={}", path.display())]);
     }
     cmd.args(["-display", "none", "-serial", "stdio"])
         .stdout(Stdio::piped())

@@ -23,4 +23,8 @@ opt-level = "s"
 lto = true
 codegen-units = 1
 panic = "abort"
+# Fail closed on integer overflow: the release .efi parses hostile on-disk
+# structures (fs, ELF), so a wrapping add must trap (→ panic handler → halt)
+# rather than silently corrupt an index or spin forever.
+overflow-checks = true
 strip = false
