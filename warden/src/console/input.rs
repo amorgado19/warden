@@ -21,6 +21,9 @@ pub enum Key {
     Digit(u8),
     /// `r` — request the rescue prompt.
     Rescue,
+    /// Any other printable ASCII byte — used by the rescue shell for its
+    /// single-letter commands (`l`/`m`/`p`/`h`/…). The menu ignores it.
+    Char(u8),
 }
 
 /// Serial ANSI-escape parser state.
@@ -72,6 +75,7 @@ impl InputReader {
                 b'j' | b'J' => Some(Key::Down),
                 b'k' | b'K' => Some(Key::Up),
                 b'r' | b'R' => Some(Key::Rescue),
+                b if b.is_ascii_graphic() => Some(Key::Char(b)),
                 _ => None,
             },
             Esc::Seen => match byte {
@@ -90,11 +94,21 @@ impl InputReader {
                 }
             },
             Esc::Csi => {
-                self.esc = Esc::Normal;
-                match byte {
-                    b'A' => Some(Key::Up),
-                    b'B' => Some(Key::Down),
-                    _ => None,
+                // Consume CSI parameter (0x30..=0x3F) and intermediate
+                // (0x20..=0x2F) bytes silently; the sequence ends at a final byte
+                // (0x40..=0x7E). This swallows modified-arrow / function-key
+                // sequences (e.g. `ESC [ 1 ; 2 A`) whole, instead of leaking their
+                // tail digits as phantom `Digit`/`Char` keystrokes that could
+                // select or boot the wrong entry.
+                if (0x40..=0x7E).contains(&byte) {
+                    self.esc = Esc::Normal;
+                    match byte {
+                        b'A' => Some(Key::Up),
+                        b'B' => Some(Key::Down),
+                        _ => None,
+                    }
+                } else {
+                    None // still inside the sequence — keep consuming
                 }
             }
         }
@@ -139,6 +153,7 @@ fn map_char(c: char) -> Option<Key> {
         'j' | 'J' => Some(Key::Down),
         'k' | 'K' => Some(Key::Up),
         'r' | 'R' => Some(Key::Rescue),
+        c if c.is_ascii_graphic() => Some(Key::Char(c as u8)),
         _ => None,
     }
 }

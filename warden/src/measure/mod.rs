@@ -62,6 +62,34 @@ fn open_tcg() -> Option<ScopedProtocol<Tcg>> {
     boot::open_protocol_exclusive::<Tcg>(handle).ok()
 }
 
+/// Print the current measured-boot state (PCR8/PCR9 SHA-256) for the rescue
+/// shell's inspect command (T8.1). Best-effort and non-fatal.
+pub fn show_measured_state() {
+    let mut tcg = match open_tcg() {
+        Some(t) => t,
+        None => {
+            log::info!("measured-boot state: no TPM (TCG2 protocol) present");
+            return;
+        }
+    };
+    for pcr in [PCR_POLICY, PCR_BINARIES] {
+        match tpm2::pcr_read_sha256(&mut tcg, pcr) {
+            Ok(v) => log::info!("PCR{pcr} (SHA-256) = {}", hex(&v)),
+            Err(e) => log::warn!("PCR{pcr} read failed: {e}"),
+        }
+    }
+}
+
+/// Lowercase hex of a byte slice.
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(char::from_digit(u32::from(b >> 4), 16).unwrap_or('0'));
+        s.push(char::from_digit(u32::from(b & 0xf), 16).unwrap_or('0'));
+    }
+    s
+}
+
 /// Measure all components into PCRs, then run the replay+PCR gate.
 pub fn measure_and_gate(inp: &Inputs) -> Outcome {
     let mut tcg = match open_tcg() {

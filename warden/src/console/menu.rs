@@ -43,32 +43,32 @@ pub fn run(config: &Config, banner: Option<&str>) -> Choice {
     let mut reader = InputReader::new();
     loop {
         if let Some(key) = reader.poll() {
-            // Any key cancels the countdown and enters interactive mode.
-            if remaining.is_some() {
-                remaining = None;
-                console::emit(mode, "\n[input received — countdown cancelled]\n");
-            }
+            // Only *actionable* keys cancel the countdown and drive the menu.
+            // Stray serial bytes (line noise, a BMC handshake) map to Key::Char or
+            // an out-of-range digit and are ignored WITHOUT cancelling the
+            // countdown — otherwise a single spurious byte could strand a headless
+            // boot / the A/B auto-rollback (AC6.1).
             match key {
                 Key::Up => {
+                    cancel_countdown(mode, &mut remaining);
                     sel = (sel + n - 1) % n;
                     render(config, sel, banner);
                     status(config, None);
                 }
                 Key::Down => {
+                    cancel_countdown(mode, &mut remaining);
                     sel = (sel + 1) % n;
                     render(config, sel, banner);
                     status(config, None);
                 }
-                Key::Digit(d) => {
-                    let d = d as usize;
-                    if (1..=n).contains(&d) {
-                        console::emit(mode, "\n[number key selects]\n");
-                        return Choice::Boot(d - 1);
-                    }
-                    // out-of-range digit: ignore
+                Key::Digit(d) if (1..=n).contains(&(d as usize)) => {
+                    console::emit(mode, "\n[number key selects]\n");
+                    return Choice::Boot(d as usize - 1);
                 }
                 Key::Enter => return Choice::Boot(sel),
                 Key::Rescue => return Choice::Rescue,
+                // Key::Char / out-of-range digit: not interaction; countdown survives.
+                _ => {}
             }
             continue;
         }
@@ -88,6 +88,14 @@ pub fn run(config: &Config, banner: Option<&str>) -> Choice {
                 status(config, remaining);
             }
         }
+    }
+}
+
+/// Cancel the auto-boot countdown on the first actionable keystroke.
+fn cancel_countdown(mode: warden_config::ConsoleMode, remaining: &mut Option<i64>) {
+    if remaining.is_some() {
+        *remaining = None;
+        console::emit(mode, "\n[input received — countdown cancelled]\n");
     }
 }
 

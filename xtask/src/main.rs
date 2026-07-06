@@ -114,6 +114,18 @@ fn main() {
         Some("test-a64") => {
             exit(if test_a64_smoke() { 0 } else { 1 });
         }
+        Some("test-chainload") => {
+            exit(if test_chainload() { 0 } else { 1 });
+        }
+        Some("test-rescue-shell") => {
+            exit(if test_rescue_shell() { 0 } else { 1 });
+        }
+        Some("test-p8") => {
+            let rescue = test_rescue_shell();
+            let chain = test_chainload();
+            eprintln!("[xtask] P8 results: rescue-shell(AC8.1)={rescue} chainload(AC8.2)={chain}");
+            exit(if rescue && chain { 0 } else { 1 });
+        }
         Some("test-a64-rich") => {
             exit(if test_a64_rich() { 0 } else { 1 });
         }
@@ -727,6 +739,79 @@ fn test_a64_rich() -> bool {
         ],
         &["WARDEN PANIC", "[refkernel] FATAL"],
     )
+}
+
+// ---------------------------------------------------------------------------
+// P8 — rescue shell + explicit chainloading
+// ---------------------------------------------------------------------------
+
+/// Build the chainload test app and stage it under test-assets as `hello.efi`.
+fn build_chainload_hello() {
+    let root = workspace_root();
+    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    eprintln!("[xtask] building chainload-hello (x86_64-unknown-uefi)…");
+    let status = Command::new(&cargo)
+        .current_dir(&root)
+        .args(["build", "-p", "chainload-hello", "--release", "--target", "x86_64-unknown-uefi"])
+        .status()
+        .expect("failed to spawn cargo for chainload-hello");
+    assert!(status.success(), "chainload-hello build failed");
+    std::fs::create_dir_all(root.join("test-assets")).ok();
+    std::fs::copy(
+        root.join("target/x86_64-unknown-uefi/release/chainload-hello.efi"),
+        root.join("test-assets/hello.efi"),
+    )
+    .expect("stage hello.efi");
+}
+
+/// AC8.2 — an entry that declares `protocol = "chainload"` launches another UEFI
+/// app (and nothing is chainloaded without such an entry).
+fn test_chainload() -> bool {
+    build();
+    stage();
+    build_chainload_hello();
+    run_scenario(Scenario {
+        name: "chainload (AC8.2)",
+        secs: 30,
+        config: "warden-chainload.toml",
+        mem: "512M",
+        accel: true,
+        stage: &[("hello.efi", "hello.efi")],
+        kernel_owns_exit: false, // the chainloaded app returns; Warden stays alive
+        tpm: false,
+        disks: &[],
+        input: None,
+        required: &["chainloading 'hello'", "CHAINLOAD-TARGET-OK"],
+        forbidden: &["WARDEN PANIC", "LoadImage failed", "StartImage failed"],
+    })
+}
+
+/// AC8.1 — the interactive rescue shell inspects measured-boot state (`p`) and
+/// boots a hand-typed entry (`2`). The default entry measures then fails to load,
+/// so Warden drops to the shell with PCRs already extended.
+fn test_rescue_shell() -> bool {
+    build();
+    stage();
+    run_scenario(Scenario {
+        name: "rescue shell (AC8.1)",
+        secs: 90,
+        config: "warden-rescue-shell.toml",
+        mem: "512M",
+        accel: true,
+        stage: &[("vmlinuz", "vmlinuz"), ("initramfs.img", "initramfs.img")],
+        kernel_owns_exit: true,
+        tpm: true,
+        disks: &[],
+        input: Some(b"p2"),
+        required: &[
+            "=== WARDEN RESCUE ===",
+            "PCR8 (SHA-256)",                 // `p` inspected measured-boot state
+            "rescue: booting one-off entry 2", // `2` booted a hand-typed entry
+            "warden_p8=rescue_boot",
+            "WARDEN-P2-USERSPACE-OK",
+        ],
+        forbidden: &["WARDEN PANIC"],
+    })
 }
 
 /// Build the bare-metal reference kernel ELF and stage it under test-assets.

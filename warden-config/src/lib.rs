@@ -82,6 +82,9 @@ pub struct Entry {
 pub enum Protocol {
     LinuxEfi,
     WardenRich,
+    /// Chainload an arbitrary UEFI application via LoadImage/StartImage (DEC-011).
+    /// Only ever used when an entry declares it — never auto-discovered.
+    Chainload,
 }
 
 /// The `[assess]` table (A/B rollback, DEC-012). Consumed in P6.
@@ -109,6 +112,7 @@ impl Protocol {
         match self {
             Protocol::LinuxEfi => "linux-efi",
             Protocol::WardenRich => "warden-rich",
+            Protocol::Chainload => "chainload",
         }
     }
 }
@@ -371,8 +375,9 @@ impl Parser {
                 let proto = match s.as_str() {
                     "linux-efi" => Protocol::LinuxEfi,
                     "warden-rich" => Protocol::WardenRich,
+                    "chainload" => Protocol::Chainload,
                     other => {
-                        return Err(ConfigError::at(line, format!("protocol = \"{other}\" invalid (expected linux-efi | warden-rich)")));
+                        return Err(ConfigError::at(line, format!("protocol = \"{other}\" invalid (expected linux-efi | warden-rich | chainload)")));
                     }
                 };
                 set_once(&mut e.protocol, proto, key, line)

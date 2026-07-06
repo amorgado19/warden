@@ -92,7 +92,7 @@ fn boot_menu_phase() {
         Ok(b) => b,
         Err(e) => {
             log::error!("config load failed: {e}");
-            console::rescue::run(None, &e);
+            console::rescue::run(None, None, &e);
             return;
         }
     };
@@ -101,7 +101,7 @@ fn boot_menu_phase() {
         Ok(t) => t,
         Err(_) => {
             log::error!("config is not valid UTF-8");
-            console::rescue::run(None, "warden.toml is not valid UTF-8");
+            console::rescue::run(None, None, "warden.toml is not valid UTF-8");
             return;
         }
     };
@@ -111,7 +111,7 @@ fn boot_menu_phase() {
         Err(e) => {
             // Readable error + rescue prompt, no crash (AC1.3).
             log::error!("config parse failed: {e}");
-            console::rescue::run(None, &format!("{e}"));
+            console::rescue::run(None, None, &format!("{e}"));
             return;
         }
     };
@@ -173,10 +173,10 @@ fn boot_menu_phase() {
                 uefi::boot::stall(core::time::Duration::from_secs(2));
                 uefi::runtime::reset(uefi::runtime::ResetType::COLD, uefi::Status::ABORTED, None);
             }
-            console::rescue::run(Some(&config), "the selected entry failed to boot");
+            console::rescue::run(Some(&config), Some(&bytes), "the selected entry failed to boot");
         }
         console::menu::Choice::Rescue => {
-            console::rescue::run(Some(&config), "rescue requested from the menu");
+            console::rescue::run(Some(&config), Some(&bytes), "rescue requested from the menu");
         }
     }
 }

@@ -1,0 +1,23 @@
+# P8 rescue-shell fixture (AC8.1). The default entry reads + measures but is not
+# a bootable PE (it points at the initramfs), so Warden drops to the interactive
+# rescue shell with PCRs already extended. The test then drives the shell over
+# serial: `p` inspects the measured-boot state, `2` boots the good entry.
+
+[global]
+timeout = 1
+default = "bad"
+console = "serial"
+
+[[entry]]
+id       = "bad"
+title    = "Unbootable (measured, then LoadImage fails)"
+protocol = "linux-efi"
+kernel   = "esp:/initramfs.img" # exists → read + measured, but not a PE → boot fails → rescue
+
+[[entry]]
+id       = "good"
+title    = "Arch Linux (real kernel)"
+protocol = "linux-efi"
+kernel   = "esp:/vmlinuz"
+initrd   = "esp:/initramfs.img"
+cmdline  = "console=ttyS0,115200 loglevel=4 warden_p8=rescue_boot"

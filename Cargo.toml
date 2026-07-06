@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["warden", "warden-abi", "warden-config", "warden-assess", "xtask", "refkernel"]
+members = ["warden", "warden-abi", "warden-config", "warden-assess", "xtask", "refkernel", "chainload-hello"]
 # `cargo build --target x86_64-unknown-uefi` at the root builds only these
 # no_std/UEFI members; xtask is a host tool (built via `cargo xtask`) and
 # refkernel is a bare-metal ELF (built for x86_64-unknown-none via `cargo xtask`).

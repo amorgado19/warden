@@ -1,0 +1,14 @@
+# P8 chainload fixture (AC8.2). An entry that explicitly declares
+# `protocol = "chainload"` — Warden LoadImage/StartImages the named UEFI app.
+# Nothing is chainloaded unless an entry declares it (DEC-011).
+
+[global]
+timeout = 1
+default = "hello"
+console = "serial"
+
+[[entry]]
+id       = "hello"
+title    = "Chainload a UEFI app (hello.efi)"
+protocol = "chainload"
+kernel   = "esp:/hello.efi"
