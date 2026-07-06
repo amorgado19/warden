@@ -10,10 +10,15 @@
 //! The in-memory layout of every type here is part of a **versioned ABI**. Any
 //! change to a field, its type, or the struct layout **must** bump
 //! [`WARDEN_ABI_VERSION`]. Kernels validate [`WardenBootInfo::magic`] and
-//! [`WardenBootInfo::abi_version`] before trusting the structure. The layout is
-//! *frozen* at the end of P4; until then it may still evolve (with a version
-//! bump each time). The compile-time assertions at the bottom of this file are
-//! the tripwire that catches accidental layout drift.
+//! [`WardenBootInfo::abi_version`] before trusting the structure.
+//!
+//! ## 🔒 FROZEN at v1 (end of P4)
+//!
+//! As of P4 this ABI is **frozen at version 1** and proven end-to-end (a
+//! reference kernel validates the contract and reads the memory map via the
+//! HHDM). The layout must not change: the `size_of`/`offset_of` assertions at
+//! the bottom of this file are the compile-time tripwire, and any deliberate
+//! future evolution requires bumping [`WARDEN_ABI_VERSION`] in lockstep.
 //!
 //! ## Representation notes
 //!
@@ -32,8 +37,8 @@
 /// `"WARDEN\0\x01"` — identifies a valid [`WardenBootInfo`] to the kernel.
 pub const WARDEN_MAGIC: u64 = 0x5741_5244_454E_0001;
 
-/// Current handoff ABI version. Bump on **any** layout change (build-spec §3.1).
-/// Not frozen until the end of P4.
+/// Handoff ABI version. **Frozen at 1** as of P4 — bump on any layout change
+/// (build-spec §3.1 / T4.5).
 pub const WARDEN_ABI_VERSION: u32 = 1;
 
 /// Page size assumed by every `pages` count in this ABI (UEFI 4 KiB pages).

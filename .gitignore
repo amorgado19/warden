@@ -22,3 +22,6 @@ OVMF_VARS*.fd
 
 # P2 test assets (downloaded kernel, built initramfs) — do not commit
 /test-assets/
+CLAUDE.md
+TASKS.md
+docs/

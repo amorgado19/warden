@@ -80,6 +80,11 @@ fn main() {
             stage();
             exit(if test_measured() { 0 } else { 1 });
         }
+        Some("test-rich") => {
+            build();
+            stage();
+            exit(if test_rich() { 0 } else { 1 });
+        }
         Some("pubkey") => print_pubkey(),
         Some("sign-kernel") => sign_kernel(),
         Some("sign-efi") => sign_efi(),
@@ -239,6 +244,59 @@ fn test_measured() -> bool {
         ],
         forbidden: &["WARDEN PANIC", "MEASURED-BOOT GATE: FAIL", "REPLAY PCR8: MISMATCH", "REPLAY PCR9: MISMATCH"],
     })
+}
+
+/// AC4.1 — the reference kernel boots via the custom warden-rich handoff:
+/// Warden loads the ELF, builds page tables, exits boot services, and jumps; the
+/// kernel validates magic+abi_version, walks the memmap via HHDM, and prints the
+/// framebuffer geometry. A page-table bug faults → QEMU resets → caught as an
+/// early exit.
+fn test_rich() -> bool {
+    build_refkernel();
+    run_scenario(Scenario {
+        name: "warden-rich (AC4.1)",
+        secs: 60,
+        config: "warden-rich.toml",
+        mem: "1G",
+        accel: true,
+        stage: &[("refkernel", "refkernel")],
+        kernel_owns_exit: false, // the ref kernel halts; QEMU still running == clean
+        tpm: false,
+        input: None,
+        required: &[
+            "jumping to warden-rich kernel",
+            "[refkernel] warden-rich kernel entered",
+            "[refkernel] CONTRACT OK",
+            "[refkernel] framebuffer",
+            "[refkernel] usable pages (walked via HHDM)",
+            "WARDEN-P4-KERNEL-OK",
+        ],
+        forbidden: &["WARDEN PANIC", "[refkernel] FATAL", "[refkernel] PANIC"],
+    })
+}
+
+/// Build the bare-metal reference kernel ELF and stage it under test-assets.
+fn build_refkernel() {
+    let root = workspace_root();
+    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    eprintln!("[xtask] building refkernel (x86_64-unknown-none)…");
+    let status = Command::new(&cargo)
+        .current_dir(&root)
+        .env(
+            "RUSTFLAGS",
+            "-C link-arg=-Trefkernel/linker.ld -C relocation-model=static -C code-model=kernel",
+        )
+        .args(["build", "-p", "refkernel", "--release", "--target", "x86_64-unknown-none"])
+        .status()
+        .expect("failed to spawn cargo for refkernel");
+    if !status.success() {
+        eprintln!("[xtask] refkernel build failed");
+        exit(1);
+    }
+    let src = root.join("target/x86_64-unknown-none/release/refkernel");
+    let dst = root.join("test-assets/refkernel");
+    std::fs::create_dir_all(root.join("test-assets")).ok();
+    std::fs::copy(&src, &dst).expect("copy refkernel");
 }
 
 /// AC3.1 (accept) — a validly-signed kernel passes verification and boots.

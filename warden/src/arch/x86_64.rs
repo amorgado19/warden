@@ -100,6 +100,27 @@ pub fn serial_read_byte() -> Option<u8> {
     }
 }
 
+/// Switch to the `pml4_phys` page tables and jump to a freshly-loaded kernel at
+/// `entry`, passing `arg` in `rdi` (System V AMD64 first argument). Never returns.
+///
+/// # Safety
+/// Boot services must already be exited. `pml4_phys` must be a valid 4-level page
+/// table that maps BOTH the current instruction stream (so the `jmp` after the
+/// `cr3` load doesn't fault) and `entry`; `entry` must be executable kernel code
+/// expecting a `WardenBootInfo*` in `rdi`. Interrupts are masked first.
+pub unsafe fn enter_kernel(pml4_phys: u64, entry: u64, arg: u64) -> ! {
+    asm!(
+        "cli",
+        "mov cr3, {pml4}",
+        "jmp {entry}",
+        pml4 = in(reg) pml4_phys,
+        entry = in(reg) entry,
+        // rdi is the kernel's first argument; set by the compiler before the block.
+        in("rdi") arg,
+        options(noreturn),
+    );
+}
+
 /// Halt the CPU forever (used at end-of-life and on panic). Never returns.
 ///
 /// Masks interrupts first: with IF clear, the firmware timer/watchdog IRQ can no

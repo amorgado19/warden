@@ -3,7 +3,9 @@
 //! P2 implements the Linux path via the EFI stub ([`linux`]). The custom
 //! "warden-rich" handoff lands in P4.
 
+mod elf;
 pub mod linux;
+pub mod warden_rich;
 
 use warden_config::{Config, Entry, Protocol};
 
@@ -18,10 +20,9 @@ pub fn boot_entry(_config: &Config, config_bytes: &[u8], entry: &Entry) {
             }
         }
         Protocol::WardenRich => {
-            log::warn!(
-                "entry '{}' uses protocol warden-rich, which is not implemented until P4",
-                entry.id
-            );
+            if let Err(e) = warden_rich::boot_warden_rich(entry, config_bytes) {
+                log::error!("warden-rich boot of '{}' failed: {e}", entry.id);
+            }
         }
     }
 }

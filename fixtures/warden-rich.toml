@@ -1,0 +1,14 @@
+# P4 rich-handoff fixture (AC4.1). Boots the reference kernel via the custom
+# warden-rich protocol: Warden loads the ELF higher-half, builds page tables,
+# exits boot services itself, and jumps with a WardenBootInfo pointer.
+
+[global]
+timeout = 1
+default = "ref"
+console = "serial"
+
+[[entry]]
+id       = "ref"
+title    = "Warden Reference Kernel (rich handoff)"
+protocol = "warden-rich"
+kernel   = "esp:/refkernel"

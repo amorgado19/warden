@@ -7,7 +7,7 @@
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::{halt, serial_init, serial_write_byte};
+pub use x86_64::{enter_kernel, halt, serial_init, serial_write_byte};
 // `serial_read_byte` is defined now but first wired up for menu input in P1
 // (T1.4); re-exported there.
 #[cfg(target_arch = "x86_64")]
