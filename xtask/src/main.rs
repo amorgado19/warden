@@ -100,6 +100,12 @@ fn main() {
             stage();
             exit(if test_btrfs_corrupt() { 0 } else { 1 });
         }
+        Some("build-a64") => {
+            build_a64();
+        }
+        Some("test-a64") => {
+            exit(if test_a64_smoke() { 0 } else { 1 });
+        }
         Some("test-p6-rollback") => {
             build();
             stage();
@@ -525,6 +531,108 @@ fn test_p6_faultinject() -> bool {
         &["WARDEN PANIC", "no Warden state disk"],
     );
     eprintln!("[xtask] P6 AC6.2 (fault-injection, no brick): {}", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+// ---------------------------------------------------------------------------
+// P7 — aarch64 port (build + QEMU virt smoke test)
+// ---------------------------------------------------------------------------
+
+const TARGET_A64: &str = "aarch64-unknown-uefi";
+const EFI_ARTIFACT_A64: &str = "target/aarch64-unknown-uefi/release/warden.efi";
+const ESP_A64: &str = "esp-a64";
+const DEFAULT_AAVMF_CODE: &str = "/usr/share/edk2/aarch64/QEMU_EFI.fd";
+const DEFAULT_AAVMF_VARS_TEMPLATE: &str = "/usr/share/edk2/aarch64/QEMU_VARS.fd";
+const AAVMF_VARS_LOCAL: &str = "AAVMF_VARS.local.fd";
+
+/// Build `warden.efi` for aarch64 and stage it as `BOOTAA64.EFI`.
+fn build_a64() {
+    let root = workspace_root();
+    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    eprintln!("[xtask] building warden.efi ({TARGET_A64}, release)…");
+    let status = Command::new(&cargo)
+        .current_dir(&root)
+        .args(["build", "-p", "warden", "--release", "--target", TARGET_A64])
+        .status()
+        .expect("failed to spawn cargo");
+    assert!(status.success(), "aarch64 warden build failed");
+    let dst = root.join(ESP_A64).join("EFI/BOOT/BOOTAA64.EFI");
+    std::fs::create_dir_all(dst.parent().unwrap()).expect("mkdir esp-a64");
+    std::fs::copy(root.join(EFI_ARTIFACT_A64), &dst).expect("stage BOOTAA64.EFI");
+    eprintln!("[xtask] staged {} -> {}", EFI_ARTIFACT_A64, dst.display());
+}
+
+/// Resolve AAVMF (aarch64 edk2) code + a writable vars copy.
+fn resolve_aavmf(root: &Path) -> (String, String) {
+    let code = env::var("AAVMF_CODE").unwrap_or_else(|_| DEFAULT_AAVMF_CODE.to_string());
+    let vars = root.join(AAVMF_VARS_LOCAL);
+    if !Path::new(&code).exists() {
+        eprintln!("[xtask] AAVMF code {code} not found — set $AAVMF_CODE (see ls /usr/share/edk2/aarch64/)");
+    }
+    if !vars.exists() {
+        std::fs::copy(DEFAULT_AAVMF_VARS_TEMPLATE, &vars)
+            .unwrap_or_else(|e| panic!("copy AAVMF vars from {DEFAULT_AAVMF_VARS_TEMPLATE}: {e}"));
+    }
+    (code, vars.to_string_lossy().into_owned())
+}
+
+/// AC7.1 (P0/P1 on aarch64) — build + boot warden.efi under QEMU `virt` + AAVMF
+/// and assert the serial banner, the memory-map dump, and the menu render.
+fn test_a64_smoke() -> bool {
+    build_a64();
+    let root = workspace_root();
+    std::fs::copy(root.join("fixtures/warden.toml"), root.join(ESP_A64).join("warden.toml")).expect("stage config");
+    let (code, vars) = resolve_aavmf(&root);
+
+    let mut cmd = Command::new("qemu-system-aarch64");
+    cmd.current_dir(&root)
+        .args(["-machine", "virt", "-cpu", "cortex-a72", "-m", "512M"])
+        .args(["-drive", &format!("if=pflash,format=raw,readonly=on,file={code}")])
+        .args(["-drive", &format!("if=pflash,format=raw,file={vars}")])
+        .args(["-drive", &format!("format=raw,file=fat:rw:{}", root.join(ESP_A64).display())])
+        .args(["-display", "none", "-serial", "stdio"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .stdin(Stdio::null());
+
+    // aarch64 runs under slow TCG on an x86 host — give the memmap dump time.
+    let secs = 150;
+    eprintln!("[xtask] booting QEMU aarch64 (virt + AAVMF, watchdog {secs}s)…");
+    let mut child = cmd.spawn().expect("failed to spawn qemu-system-aarch64");
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let (tx, rx) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    let _ = watch(&mut child, secs);
+    let buf = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+    let _ = reader.join();
+    let log = String::from_utf8_lossy(&buf);
+    println!("----- captured serial (aarch64 smoke) -----\n{log}\n----- end serial -----");
+
+    let required = [
+        "[aarch64]",                   // P0: banner on the aarch64 PL011 serial
+        "UEFI memory map:",            // P0: memmap dump
+        "memory summary:",             // P0: summary
+        "=== Warden boot menu ===",    // P1: menu renders
+        "auto-boot 'demo'",            // P1: countdown
+    ];
+    let forbidden = ["WARDEN PANIC"];
+    let mut ok = true;
+    for m in required {
+        let present = log.contains(m);
+        eprintln!("[xtask] require {:>4}: {m:?}", if present { "OK" } else { "MISS" });
+        ok &= present;
+    }
+    for f in forbidden {
+        if log.contains(f) {
+            eprintln!("[xtask] forbid  HIT: {f:?}");
+            ok = false;
+        }
+    }
+    eprintln!("[xtask] scenario aarch64 smoke (AC7.1 P0/P1): {}", if ok { "PASS" } else { "FAIL" });
     ok
 }
 

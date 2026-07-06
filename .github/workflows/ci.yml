@@ -1,0 +1,67 @@
+name: warden CI
+
+# T7.4 — dual-arch CI: build both UEFI targets, run the host-testable parser /
+# assessment unit tests, and boot-smoke each architecture under QEMU (P0/P1:
+# serial banner + memory-map dump + menu render — no external kernel needed).
+# The heavier boot-matrix (P2 Linux, P3 measured boot, P4 rich handoff, P6 A/B)
+# runs locally via `cargo xtask test-*`; those need downloaded/built assets and
+# swtpm and are out of scope for a fast push gate.
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  host-tests:
+    name: host unit tests (parsers + assess)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p warden-config -p warden-assess
+
+  build:
+    name: build ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.arch }}-unknown-uefi
+      # Zero-warning gate (GC / AC*.1): warnings are denied.
+      - run: RUSTFLAGS="-D warnings" cargo build -p warden --release --target ${{ matrix.arch }}-unknown-uefi
+
+  smoke:
+    name: QEMU boot smoke ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.arch }}-unknown-uefi
+      - name: install QEMU + edk2 firmware
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-system-arm ovmf qemu-efi-aarch64 mtools
+      - name: x86_64 boot smoke (P0/P1)
+        if: matrix.arch == 'x86_64'
+        env:
+          OVMF_CODE: /usr/share/OVMF/OVMF_CODE.fd
+        run: cargo xtask test-menu
+      - name: aarch64 boot smoke (P0/P1)
+        if: matrix.arch == 'aarch64'
+        env:
+          AAVMF_CODE: /usr/share/AAVMF/AAVMF_CODE.fd
+        run: cargo xtask test-a64

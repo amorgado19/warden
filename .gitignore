@@ -1,13 +1,16 @@
 # Rust build output
 /target
 
-# Local, writable OVMF firmware variables (copied per-checkout from edk2 package)
+# Local, writable OVMF/AAVMF firmware variables (copied per-checkout from edk2)
 /OVMF_VARS.local.fd
 OVMF_VARS*.fd
+/AAVMF_VARS.local.fd
+AAVMF_VARS*.fd
 
-# QEMU ESP staging directory — build artifacts + locally-generated test configs.
-# Tracked test fixtures live under fixtures/ and are copied in by xtask.
+# QEMU ESP staging directories (x86_64 + aarch64) — build artifacts + locally
+# generated test configs. Tracked fixtures live under fixtures/, copied by xtask.
 /esp/
+/esp-a64/
 
 # Machine-local Claude Code settings + stray temp files
 .claude/settings.local.json
