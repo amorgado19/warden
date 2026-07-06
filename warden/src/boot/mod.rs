@@ -28,6 +28,13 @@ pub fn load_image_from_buffer(buffer: &[u8]) -> Result<Handle, String> {
     // Keep the protocol wrapper alive across `load_image` (it borrows the path).
     let self_li = boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle()).ok();
     let file_path = self_li.as_ref().and_then(|li| li.file_path());
+    if file_path.is_none() {
+        // We could not obtain our own device path, so the load falls back to a
+        // NULL path — which AAVMF (arm64) rejects with INVALID_PARAMETER. Surface
+        // the root cause so that failure isn't misread as a bad image. OVMF
+        // tolerates a NULL path, so we still proceed rather than refuse the boot.
+        log::warn!("LoadImage: no self device path available — arm64 firmware may reject this load");
+    }
     boot::load_image(boot::image_handle(), LoadImageSource::FromBuffer { buffer, file_path })
         .map_err(|e| format!("LoadImage failed: {e:?}"))
 }
