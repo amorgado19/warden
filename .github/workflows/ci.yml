@@ -52,16 +52,14 @@ jobs:
         with:
           targets: ${{ matrix.arch }}-unknown-uefi
       - name: install QEMU + edk2 firmware
+        # xtask auto-detects the firmware paths (Debian/Ubuntu `OVMF`/`AAVMF`
+        # layouts, or Arch `edk2/*`), so no firmware-path env is needed here.
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 qemu-system-arm ovmf qemu-efi-aarch64 mtools
       - name: x86_64 boot smoke (P0/P1)
         if: matrix.arch == 'x86_64'
-        env:
-          OVMF_CODE: /usr/share/OVMF/OVMF_CODE.fd
         run: cargo xtask test-menu
       - name: aarch64 boot smoke (P0/P1)
         if: matrix.arch == 'aarch64'
-        env:
-          AAVMF_CODE: /usr/share/AAVMF/AAVMF_CODE.fd
         run: cargo xtask test-a64

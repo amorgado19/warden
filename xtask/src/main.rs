@@ -29,9 +29,17 @@ const TARGET: &str = "x86_64-unknown-uefi";
 const EFI_ARTIFACT: &str = "target/x86_64-unknown-uefi/release/warden.efi";
 const ESP_TARGET: &str = "esp/EFI/BOOT/BOOTX64.EFI";
 const ESP_CONFIG: &str = "esp/warden.toml";
-const DEFAULT_OVMF_CODE: &str = "/usr/share/edk2/x64/OVMF_CODE.4m.fd";
-const DEFAULT_OVMF_VARS_TEMPLATE: &str = "/usr/share/edk2/x64/OVMF_VARS.4m.fd";
 const DEFAULT_OVMF_VARS_LOCAL: &str = "OVMF_VARS.local.fd";
+/// Candidate (CODE, VARS-template) OVMF pairs, most-specific first. Each pair is
+/// a matched build (2 MiB vs 4 MiB must not be mixed). Covers Arch
+/// (`edk2/x64`) and Debian/Ubuntu (`OVMF/*_4M`, `OVMF/*`) layouts so CI needs no
+/// firmware-path env. `$OVMF_CODE` still overrides the code image.
+const OVMF_PAIRS: &[(&str, &str)] = &[
+    ("/usr/share/edk2/x64/OVMF_CODE.4m.fd", "/usr/share/edk2/x64/OVMF_VARS.4m.fd"),
+    ("/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_VARS_4M.fd"),
+    ("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"),
+    ("/usr/share/edk2-ovmf/x64/OVMF_CODE.fd", "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd"),
+];
 
 /// Fixed **test** ed25519 seed → a deterministic keypair, so the public key
 /// embedded in Warden and the private key used to sign here always match without
@@ -547,9 +555,14 @@ fn test_p6_faultinject() -> bool {
 const TARGET_A64: &str = "aarch64-unknown-uefi";
 const EFI_ARTIFACT_A64: &str = "target/aarch64-unknown-uefi/release/warden.efi";
 const ESP_A64: &str = "esp-a64";
-const DEFAULT_AAVMF_CODE: &str = "/usr/share/edk2/aarch64/QEMU_EFI.fd";
-const DEFAULT_AAVMF_VARS_TEMPLATE: &str = "/usr/share/edk2/aarch64/QEMU_VARS.fd";
 const AAVMF_VARS_LOCAL: &str = "AAVMF_VARS.local.fd";
+/// Candidate (CODE, VARS-template) AAVMF pairs — Arch (`edk2/aarch64`) and
+/// Debian/Ubuntu (`AAVMF/*`, `qemu-efi-aarch64/*`). `$AAVMF_CODE` overrides the code.
+const AAVMF_PAIRS: &[(&str, &str)] = &[
+    ("/usr/share/edk2/aarch64/QEMU_EFI.fd", "/usr/share/edk2/aarch64/QEMU_VARS.fd"),
+    ("/usr/share/AAVMF/AAVMF_CODE.fd", "/usr/share/AAVMF/AAVMF_VARS.fd"),
+    ("/usr/share/qemu-efi-aarch64/QEMU_EFI.fd", "/usr/share/qemu-efi-aarch64/QEMU_VARS.fd"),
+];
 
 /// Build `warden.efi` for aarch64 and stage it as `BOOTAA64.EFI`.
 fn build_a64() {
@@ -570,14 +583,13 @@ fn build_a64() {
 
 /// Resolve AAVMF (aarch64 edk2) code + a writable vars copy.
 fn resolve_aavmf(root: &Path) -> (String, String) {
-    let code = env::var("AAVMF_CODE").unwrap_or_else(|_| DEFAULT_AAVMF_CODE.to_string());
+    let (code, vars_tpl) = find_firmware("AAVMF_CODE", AAVMF_PAIRS);
     let vars = root.join(AAVMF_VARS_LOCAL);
-    if !Path::new(&code).exists() {
-        eprintln!("[xtask] AAVMF code {code} not found — set $AAVMF_CODE (see ls /usr/share/edk2/aarch64/)");
-    }
     if !vars.exists() {
-        std::fs::copy(DEFAULT_AAVMF_VARS_TEMPLATE, &vars)
-            .unwrap_or_else(|e| panic!("copy AAVMF vars from {DEFAULT_AAVMF_VARS_TEMPLATE}: {e}"));
+        std::fs::copy(&vars_tpl, &vars).unwrap_or_else(|e| {
+            eprintln!("[xtask] cannot create writable AAVMF vars {} from {vars_tpl}: {e}", vars.display());
+            exit(1);
+        });
     }
     (code, vars.to_string_lossy().into_owned())
 }
@@ -1036,30 +1048,48 @@ fn stage_config(name: &str) {
 
 /// Resolve OVMF firmware paths, failing loudly if the CODE image is missing and
 /// auto-creating the writable VARS file from the edk2 template when absent.
-fn resolve_ovmf(root: &Path) -> (String, String) {
-    let code = env::var("OVMF_CODE").unwrap_or_else(|_| DEFAULT_OVMF_CODE.to_string());
-    let vars = env::var("OVMF_VARS")
-        .unwrap_or_else(|_| root.join(DEFAULT_OVMF_VARS_LOCAL).to_string_lossy().into_owned());
-
-    if !Path::new(&code).exists() {
-        eprintln!(
-            "[xtask] OVMF CODE image not found: {code}\n\
-             [xtask] set $OVMF_CODE to your edk2 OVMF_CODE*.fd (see `ls /usr/share/edk2/x64/`)."
-        );
-        exit(1);
-    }
-    if !Path::new(&vars).exists() {
-        match std::fs::copy(DEFAULT_OVMF_VARS_TEMPLATE, &vars) {
-            Ok(_) => eprintln!("[xtask] created writable OVMF vars {vars} from {DEFAULT_OVMF_VARS_TEMPLATE}"),
-            Err(e) => {
-                eprintln!(
-                    "[xtask] OVMF VARS file {vars} missing and could not be created from \
-                     {DEFAULT_OVMF_VARS_TEMPLATE}: {e}\n\
-                     [xtask] set $OVMF_VARS to a writable copy of your edk2 OVMF_VARS*.fd."
-                );
-                exit(1);
+/// Pick the first firmware (CODE, VARS-template) pair whose files exist,
+/// honouring `$<code_env>` as a code override. Exits with guidance if none is
+/// found (so CI on Arch or Debian/Ubuntu both work without a firmware-path env).
+fn find_firmware(code_env: &str, pairs: &[(&str, &str)]) -> (String, String) {
+    let override_code = env::var(code_env).ok();
+    if let Some(oc) = &override_code {
+        // Override that names a known pair with existing files → use that pair.
+        if let Some((c, v)) = pairs.iter().find(|(c, _)| c == oc) {
+            if Path::new(c).exists() && Path::new(v).exists() {
+                return ((*c).to_string(), (*v).to_string());
             }
         }
+        // Override exists but isn't a known pair → use it + first existing vars.
+        if Path::new(oc).exists() {
+            if let Some((_, v)) = pairs.iter().find(|(_, v)| Path::new(v).exists()) {
+                return (oc.clone(), (*v).to_string());
+            }
+        }
+    }
+    for (c, v) in pairs {
+        if Path::new(c).exists() && Path::new(v).exists() {
+            return ((*c).to_string(), (*v).to_string());
+        }
+    }
+    eprintln!("[xtask] no {code_env} firmware pair found — install edk2/OVMF/AAVMF or set ${code_env}. Tried:");
+    for (c, v) in pairs {
+        eprintln!("          {c}  +  {v}");
+    }
+    exit(1);
+}
+
+/// Resolve OVMF: a firmware CODE image + a writable, per-checkout VARS copy.
+fn resolve_ovmf(root: &Path) -> (String, String) {
+    let (code, vars_tpl) = find_firmware("OVMF_CODE", OVMF_PAIRS);
+    let vars = env::var("OVMF_VARS")
+        .unwrap_or_else(|_| root.join(DEFAULT_OVMF_VARS_LOCAL).to_string_lossy().into_owned());
+    if !Path::new(&vars).exists() {
+        std::fs::copy(&vars_tpl, &vars).unwrap_or_else(|e| {
+            eprintln!("[xtask] cannot create writable OVMF vars {vars} from {vars_tpl}: {e}");
+            exit(1);
+        });
+        eprintln!("[xtask] created writable OVMF vars {vars} from {vars_tpl}");
     }
     (code, vars)
 }
